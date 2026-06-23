@@ -29,7 +29,7 @@ func MustBinDir(t *testing.T) string {
 func NewKeyFile(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "master.key")
-	cmd := exec.Command(filepath.Join(MustBinDir(t), "git-cloak"), "keygen", "--key", "file:"+path)
+	cmd := exec.Command(filepath.Join(MustBinDir(t), "git-cloak"), "keygen", "--key", "file:"+path) // #nosec G204 -- test harness: fixed binary, test-controlled args
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("keygen: %v\n%s", err, out)
 	}
@@ -48,7 +48,7 @@ func NewHost(t *testing.T) *Host {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "host.git")
 	h := &Host{T: t, Dir: dir}
-	if out, err := exec.Command("git", "init", "--bare", "--initial-branch", "cloak", dir).CombinedOutput(); err != nil {
+	if out, err := exec.Command("git", "init", "--bare", "--initial-branch", "cloak", dir).CombinedOutput(); err != nil { // #nosec G204 -- test harness: fixed binary, test-controlled args
 		t.Fatalf("init host: %v\n%s", err, out)
 	}
 	h.Git("config", "uploadpack.allowfilter", "true")
@@ -58,7 +58,7 @@ func NewHost(t *testing.T) *Host {
 // Git runs git against the host repo, failing the test on error.
 func (h *Host) Git(args ...string) string {
 	h.T.Helper()
-	cmd := exec.Command("git", append([]string{"--git-dir", h.Dir}, args...)...)
+	cmd := exec.Command("git", append([]string{"--git-dir", h.Dir}, args...)...) // #nosec G204 -- test harness: fixed binary, test-controlled args
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		h.T.Fatalf("host git %v: %v\n%s", args, err, out)
@@ -70,10 +70,10 @@ func (h *Host) Git(args ...string) string {
 func (h *Host) InstallPreReceive(script string) {
 	h.T.Helper()
 	hooks := filepath.Join(h.Dir, "hooks")
-	if err := os.MkdirAll(hooks, 0o755); err != nil {
+	if err := os.MkdirAll(hooks, 0o755); err != nil { // #nosec G301 -- test fixture dir; ephemeral t.TempDir() tree
 		h.T.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(hooks, "pre-receive"), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(hooks, "pre-receive"), []byte(script), 0o755); err != nil { // #nosec G306 -- test fixture: git hook must be executable
 		h.T.Fatal(err)
 	}
 }
@@ -88,7 +88,7 @@ func (h *Host) RemovePreReceive() {
 // (binary-safe; needed for cat-file blob).
 func (h *Host) GitRaw(t *testing.T, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"--git-dir", h.Dir}, args...)...)
+	cmd := exec.Command("git", append([]string{"--git-dir", h.Dir}, args...)...) // #nosec G204 -- test harness: fixed binary, test-controlled args
 	var out, errb strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -102,7 +102,7 @@ func (h *Host) GitRaw(t *testing.T, args ...string) string {
 // returns its oid.
 func (h *Host) HashObjectStdin(t *testing.T, data []byte) string {
 	t.Helper()
-	cmd := exec.Command("git", "--git-dir", h.Dir, "hash-object", "-w", "--stdin")
+	cmd := exec.Command("git", "--git-dir", h.Dir, "hash-object", "-w", "--stdin") // #nosec G204 -- test harness: fixed binary, test-controlled args
 	cmd.Stdin = bytes.NewReader(data)
 	out, err := cmd.Output()
 	if err != nil {
@@ -120,6 +120,31 @@ func (h *Host) ReplaceTreeEntry(t *testing.T, branch, path, newBlobOID string) {
 	tip := h.Git("rev-parse", branch)
 	// Read the full recursive tree, swap the target entry, rebuild trees.
 	lsOut := h.Git("ls-tree", "-r", tip)
+	newTree := h.mktreeRecursive(t, rewriteTreeFlat(t, lsOut, path, newBlobOID))
+	parents := strings.Fields(h.Git("rev-list", "--parents", "-n", "1", tip))
+	commitArgs := []string{"commit-tree", newTree, "-m", "cloak"}
+	for _, p := range parents[1:] {
+		commitArgs = append(commitArgs, "-p", p)
+	}
+	authInfo := h.Git("log", "-1", "--format=%an|%ae|%ad", "--date=raw", tip)
+	parts := strings.Split(authInfo, "|")
+	env := []string{
+		"GIT_AUTHOR_NAME=" + parts[0], "GIT_AUTHOR_EMAIL=" + parts[1], "GIT_AUTHOR_DATE=" + parts[2],
+		"GIT_COMMITTER_NAME=" + parts[0], "GIT_COMMITTER_EMAIL=" + parts[1], "GIT_COMMITTER_DATE=" + parts[2],
+	}
+	cmd := exec.Command("git", append([]string{"--git-dir", h.Dir}, commitArgs...)...) // #nosec G204 -- test harness: fixed binary, test-controlled args
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("host commit-tree: %v", err)
+	}
+	h.Git("update-ref", "refs/heads/"+branch, strings.TrimSpace(string(out)))
+}
+
+// rewriteTreeFlat parses recursive ls-tree output and returns flat
+// "mode type oid\tpath" lines with the entry at path repointed to newBlobOID.
+func rewriteTreeFlat(t *testing.T, lsOut, path, newBlobOID string) string {
+	t.Helper()
 	var b strings.Builder
 	for _, line := range strings.Split(lsOut, "\n") {
 		meta, name, found := strings.Cut(line, "\t")
@@ -136,25 +161,7 @@ func (h *Host) ReplaceTreeEntry(t *testing.T, branch, path, newBlobOID string) {
 		}
 		fmt.Fprintf(&b, "%s %s %s\t%s\n", mode, typ, oid, name)
 	}
-	newTree := h.mktreeRecursive(t, b.String())
-	parents := strings.Fields(h.Git("rev-list", "--parents", "-n", "1", tip))
-	commitArgs := []string{"commit-tree", newTree, "-m", "cloak"}
-	for _, p := range parents[1:] {
-		commitArgs = append(commitArgs, "-p", p)
-	}
-	authInfo := h.Git("log", "-1", "--format=%an|%ae|%ad", "--date=raw", tip)
-	parts := strings.Split(authInfo, "|")
-	env := []string{
-		"GIT_AUTHOR_NAME=" + parts[0], "GIT_AUTHOR_EMAIL=" + parts[1], "GIT_AUTHOR_DATE=" + parts[2],
-		"GIT_COMMITTER_NAME=" + parts[0], "GIT_COMMITTER_EMAIL=" + parts[1], "GIT_COMMITTER_DATE=" + parts[2],
-	}
-	cmd := exec.Command("git", append([]string{"--git-dir", h.Dir}, commitArgs...)...)
-	cmd.Env = append(os.Environ(), env...)
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("host commit-tree: %v", err)
-	}
-	h.Git("update-ref", "refs/heads/"+branch, strings.TrimSpace(string(out)))
+	return b.String()
 }
 
 // mktreeRecursive builds nested trees from flat "mode type oid\tpath" lines
@@ -165,14 +172,14 @@ func (h *Host) mktreeRecursive(t *testing.T, flat string) string {
 	for _, line := range strings.Split(strings.TrimSpace(flat), "\n") {
 		meta, name, _ := strings.Cut(line, "\t")
 		fields := strings.Fields(meta)
-		cmd := exec.Command("git", "--git-dir", h.Dir, "update-index", "--add",
+		cmd := exec.Command("git", "--git-dir", h.Dir, "update-index", "--add", // #nosec G204 -- test harness: fixed binary, test-controlled args
 			"--cacheinfo", fields[0]+","+fields[2]+","+name)
 		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+idx)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("update-index: %v\n%s", err, out)
 		}
 	}
-	cmd := exec.Command("git", "--git-dir", h.Dir, "write-tree")
+	cmd := exec.Command("git", "--git-dir", h.Dir, "write-tree") // #nosec G204 -- test harness: fixed binary, test-controlled args
 	cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+idx)
 	out, err := cmd.Output()
 	if err != nil {
@@ -231,19 +238,25 @@ func NewClient(t *testing.T, name, keyFile string) *Client {
 	return &Client{T: t, Base: base, Dir: filepath.Join(base, "repo"), Env: env, bin: bin}
 }
 
-func (c *Client) run(name string, args ...string) (string, string, error) {
-	cmd := exec.Command(name, args...)
+// runEnv runs name with the given environment, working inside the repo when it
+// exists (else the base dir), and returns captured stdout, stderr, and error.
+func (c *Client) runEnv(env []string, name string, args ...string) (string, string, error) {
+	cmd := exec.Command(name, args...) // #nosec G204 -- test harness: fixed binary, test-controlled args
 	if _, err := os.Stat(c.Dir); err == nil {
 		cmd.Dir = c.Dir
 	} else {
 		cmd.Dir = c.Base
 	}
-	cmd.Env = c.Env
+	cmd.Env = env
 	var out, errb strings.Builder
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	err := cmd.Run()
 	return out.String(), errb.String(), err
+}
+
+func (c *Client) run(name string, args ...string) (string, string, error) {
+	return c.runEnv(c.Env, name, args...)
 }
 
 // Git runs git in the client environment (inside the repo when it exists).
@@ -252,18 +265,7 @@ func (c *Client) Git(args ...string) (string, string, error) { return c.run("git
 // GitEnv runs git with extra environment variables appended (e.g. the
 // CLOAK_TEST_HOLD_BEFORE_PUSH synchronization hook).
 func (c *Client) GitEnv(extra []string, args ...string) (string, string, error) {
-	cmd := exec.Command("git", args...)
-	if _, err := os.Stat(c.Dir); err == nil {
-		cmd.Dir = c.Dir
-	} else {
-		cmd.Dir = c.Base
-	}
-	cmd.Env = append(append([]string{}, c.Env...), extra...)
-	var out, errb strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	err := cmd.Run()
-	return out.String(), errb.String(), err
+	return c.runEnv(append(append([]string{}, c.Env...), extra...), "git", args...)
 }
 
 // MustGit runs git and fails the test on error.
@@ -290,7 +292,7 @@ func (c *Client) CloakStdin(s string, args ...string) (string, string, error) {
 // CloakStdinBytes runs git-cloak feeding s on stdin, returning raw stdout
 // bytes (binary-safe; needed for ciphertext output).
 func (c *Client) CloakStdinBytes(s string, args ...string) ([]byte, string, error) {
-	cmd := exec.Command(filepath.Join(c.bin, "git-cloak"), args...)
+	cmd := exec.Command(filepath.Join(c.bin, "git-cloak"), args...) // #nosec G204 -- test harness: fixed binary, test-controlled args
 	cmd.Dir = c.Base
 	cmd.Env = c.Env
 	cmd.Stdin = strings.NewReader(s)
@@ -320,7 +322,7 @@ func (c *Client) MustCloak(args ...string) string {
 func (c *Client) InstallGitShim(t *testing.T) string {
 	t.Helper()
 	shimDir := filepath.Join(c.Base, "shim")
-	if err := os.MkdirAll(shimDir, 0o755); err != nil {
+	if err := os.MkdirAll(shimDir, 0o755); err != nil { // #nosec G301 -- test fixture dir; ephemeral t.TempDir() tree
 		t.Fatal(err)
 	}
 	logPath := filepath.Join(c.Base, "git-invocations.log")
@@ -329,7 +331,7 @@ func (c *Client) InstallGitShim(t *testing.T) string {
 		t.Fatal(err)
 	}
 	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + logPath + "\nexec " + realGit + " \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(script), 0o755); err != nil { // #nosec G306 -- test fixture: git shim must be executable
 		t.Fatal(err)
 	}
 	for i, kv := range c.Env {
@@ -355,14 +357,22 @@ func (c *Client) MustClone(url string) {
 	}
 }
 
+// AddOrigin adds a cloak::<url> origin remote to the client's repo. It owns
+// the cloak:: scheme for the push-side setup the suites repeat before their
+// first push, the symmetric counterpart of MustClone on the fetch side.
+func (c *Client) AddOrigin(url string) {
+	c.T.Helper()
+	c.MustGit("remote", "add", "origin", "cloak::"+url)
+}
+
 // WriteFile writes content under the repo working tree.
 func (c *Client) WriteFile(rel, content string) {
 	c.T.Helper()
 	path := filepath.Join(c.Dir, rel)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { // #nosec G301 -- test fixture dir; ephemeral t.TempDir() tree
 		c.T.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil { // #nosec G306 -- test fixture: ephemeral working-tree file
 		c.T.Fatal(err)
 	}
 }
@@ -387,7 +397,7 @@ func (c *Client) DebugLog() string {
 	root := filepath.Join(c.Dir, ".git", "cloak")
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() && filepath.Base(path) == "log" {
-			b, rerr := os.ReadFile(path)
+			b, rerr := os.ReadFile(path) // #nosec G304 G122 -- test-only walk reading the client's own ephemeral .git/cloak logs
 			if rerr == nil {
 				fmt.Fprintf(&sb, "==> %s\n%s\n", path, b)
 			}

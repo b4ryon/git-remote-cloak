@@ -24,7 +24,7 @@ func TestCrossRepoSubstitutionRejected(t *testing.T) {
 	a.InitRepo()
 	a.WriteFile("f.md", "real content\n")
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	realOID := a.HeadOID()
 
@@ -70,7 +70,7 @@ func TestWithheldPackDoesNotAdvancePin(t *testing.T) {
 	a.MustGit("config", "cloak.geometricFactor", "0") // keep the two packs separate
 	a.WriteFile("a.md", strings.Repeat("alpha ", 500))
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 
 	victim := harness.NewClient(t, "victim", key)

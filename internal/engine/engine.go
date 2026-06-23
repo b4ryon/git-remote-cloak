@@ -47,6 +47,17 @@ type RemoteState struct {
 	ManifestHash string
 }
 
+// ciphertextHash returns the SHA-256 hex digest of a manifest ciphertext. It
+// is the value recorded as the rollback pin's ManifestHash, so the read path
+// (LoadRemoteState, which checks the pin) and the write path
+// (buildBackendCommit, which stores it) MUST compute it identically for a
+// freshly pushed pin to match on the next fetch; centralizing it here guarantees
+// the two cannot drift apart.
+func ciphertextHash(ct []byte) string {
+	sum := sha256.Sum256(ct)
+	return hex.EncodeToString(sum[:])
+}
+
 // LoadRemoteState fetches the backend branch, decrypts and validates the
 // manifest, and enforces the rollback pin and repository-identity TOFU. It
 // does NOT advance the local pins: those are persisted by CommitPin only
@@ -65,12 +76,19 @@ func (e *Engine) LoadRemoteState() (*RemoteState, error) {
 		e.Log.Info("remote is empty (no backend branch yet)")
 		return &RemoteState{}, nil
 	}
+	return e.loadPopulatedState(head)
+}
+
+// loadPopulatedState reads, decrypts, decodes, and pin/identity-validates the
+// manifest at a non-empty backend head. It is the populated-remote half of
+// LoadRemoteState, split out so the empty-remote short-circuit and this
+// decrypt-and-validate pipeline are each below the complexity threshold.
+func (e *Engine) loadPopulatedState(head string) (*RemoteState, error) {
 	ct, err := e.Be.ReadBlobBytes(head, "manifest.age")
 	if err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256(ct)
-	hash := hex.EncodeToString(sum[:])
+	hash := ciphertextHash(ct)
 	pt, err := agecrypt.DecryptBytes(e.Key, ct)
 	if err != nil {
 		// The manifest is the first thing decrypted on every fetch/clone, and at
@@ -159,61 +177,9 @@ func (e *Engine) FetchApply(rs *RemoteState) (keepFiles []string, err error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// The no-download shortcut below is gated on the local repo already holding
-	// the COMPLETE object closure of every manifest ref tip, not merely the
-	// tips. A tip can be present while its history is not (e.g. an interrupted
-	// prior index-pack, a graft, a partial prune); marking a pack applied in
-	// that case would permanently skip the pack that carries the missing
-	// objects, since the applied set is never re-examined. The closure check is
-	// computed lazily (only when a pack actually needs the shortcut) so the
-	// common case where every pack is already applied pays nothing.
-	tips := make([]string, 0, len(rs.Manifest.Refs))
-	for _, oid := range rs.Manifest.Refs {
-		tips = append(tips, oid)
-	}
-	closureChecked, closureComplete := false, false
-
-	var newlyApplied []string
-	for _, p := range rs.Manifest.Packs {
-		if applied[p.ID] {
-			continue
-		}
-		if len(p.Replaces) > 0 {
-			all := true
-			for _, r := range p.Replaces {
-				if !applied[r] {
-					all = false
-					break
-				}
-			}
-			if all {
-				e.Log.Info("pack covered by applied predecessors; skipping download",
-					"pack", p.ID[:12], "replaces", len(p.Replaces))
-				newlyApplied = append(newlyApplied, p.ID)
-				applied[p.ID] = true
-				continue
-			}
-		}
-		if !closureChecked {
-			closureComplete = e.HasObjectClosure(tips)
-			closureChecked = true
-		}
-		if closureComplete {
-			// Local repo already holds every object these packs would deliver.
-			newlyApplied = append(newlyApplied, p.ID)
-			applied[p.ID] = true
-			continue
-		}
-		keep, err := e.applyPack(rs.Head, p)
-		if err != nil {
-			return nil, err
-		}
-		if keep != "" {
-			keepFiles = append(keepFiles, keep)
-		}
-		newlyApplied = append(newlyApplied, p.ID)
-		applied[p.ID] = true
+	keepFiles, newlyApplied, err := e.applyManifestPacks(rs, applied)
+	if err != nil {
+		return nil, err
 	}
 	if err := e.St.MarkApplied(newlyApplied...); err != nil {
 		return nil, err
@@ -221,11 +187,119 @@ func (e *Engine) FetchApply(rs *RemoteState) (keepFiles []string, err error) {
 	return keepFiles, nil
 }
 
+// applyManifestPacks walks the manifest packs in order, downloading and
+// indexing each not-yet-applied pack unless it can be skipped, and returns the
+// .keep files created plus the ids to mark applied. The applied map is updated
+// as it goes so a later pack's predecessor check sees earlier packs.
+func (e *Engine) applyManifestPacks(rs *RemoteState, applied map[string]bool) (keepFiles, newlyApplied []string, err error) {
+	closure := e.lazyClosure(rs.Manifest.Refs)
+	for _, p := range rs.Manifest.Packs {
+		if applied[p.ID] {
+			continue
+		}
+		keep, err := e.downloadUnlessSkippable(rs.Head, p, applied, closure)
+		if err != nil {
+			return nil, nil, err
+		}
+		if keep != "" {
+			keepFiles = append(keepFiles, keep)
+		}
+		newlyApplied = append(newlyApplied, p.ID)
+		applied[p.ID] = true
+	}
+	return keepFiles, newlyApplied, nil
+}
+
+// downloadUnlessSkippable downloads and indexes pack p unless packSkippable
+// reports it can be marked applied without downloading, in which case it
+// returns an empty keep path. The returned keep is the .keep file created by
+// index-pack (empty when the pack was skipped or carried no keep file).
+func (e *Engine) downloadUnlessSkippable(head string, p manifest.Pack, applied map[string]bool, closure func() bool) (keep string, err error) {
+	if e.packSkippable(p, applied, closure) {
+		return "", nil
+	}
+	return e.applyPack(head, p)
+}
+
+// packSkippable reports whether pack p can be marked applied without
+// downloading it: either every pack it replaces is already applied, or the
+// local repo already holds the complete object closure of every ref tip.
+func (e *Engine) packSkippable(p manifest.Pack, applied map[string]bool, closure func() bool) bool {
+	if replacesCovered(p, applied) {
+		e.Log.Info("pack covered by applied predecessors; skipping download",
+			"pack", p.ID[:12], "replaces", len(p.Replaces))
+		return true
+	}
+	// Local repo already holds every object this pack would deliver.
+	return closure()
+}
+
+// replacesCovered reports whether pack p supersedes earlier packs and every
+// one of them is already applied locally, so p delivers nothing new.
+func replacesCovered(p manifest.Pack, applied map[string]bool) bool {
+	if len(p.Replaces) == 0 {
+		return false
+	}
+	for _, r := range p.Replaces {
+		if !applied[r] {
+			return false
+		}
+	}
+	return true
+}
+
+// lazyClosure returns a memoized predicate reporting whether the local repo
+// holds the COMPLETE object closure of every manifest ref tip, not merely the
+// tips. A tip can be present while its history is not (e.g. an interrupted
+// prior index-pack, a graft, a partial prune); marking a pack applied in that
+// case would permanently skip the pack that carries the missing objects, since
+// the applied set is never re-examined. The check is computed at most once, and
+// only when a pack actually needs the shortcut, so the common case where every
+// pack is already applied pays nothing.
+func (e *Engine) lazyClosure(refs map[string]string) func() bool {
+	tips := make([]string, 0, len(refs))
+	for _, oid := range refs {
+		tips = append(tips, oid)
+	}
+	checked, complete := false, false
+	return func() bool {
+		if !checked {
+			complete = e.HasObjectClosure(tips)
+			checked = true
+		}
+		return complete
+	}
+}
+
 // packTamperHint is attached to pack verify/decrypt failures. Unlike the
 // manifest, a pack is only reached after the manifest already decrypted under
 // the same key, so the key is provably correct and a failure here points at
 // the host serving bad data rather than a wrong key.
 const packTamperHint = "the manifest decrypted under this key but this pack did not, so the key is correct; the host likely served corrupted or tampered pack data. Re-fetch and check the debug log"
+
+// downloadVerifyPack downloads packs/<id>.age from the backend commit head
+// into ctPath, hashing the ciphertext as it streams, and fails if the hash
+// does not match the manifest pack id (the host served corrupted or tampered
+// data, since the key is already proven correct by the manifest decrypt).
+func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error {
+	f, err := os.OpenFile(ctPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	hasher := sha256.New()
+	if err := e.Be.ReadBlob(head, "packs/"+p.ID+".age", io.MultiWriter(f, hasher)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != p.ID {
+		return cloakerr.Newf(cloakerr.Tamper, "verify pack "+p.ID[:12],
+			"ciphertext hash %s does not match manifest id %s", got, p.ID).WithHint(packTamperHint)
+	}
+	return nil
+}
 
 // applyPack downloads packs/<id>.age, verifies and decrypts it, and feeds
 // the plaintext pack to git index-pack in the local repository.
@@ -236,44 +310,41 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 	defer os.Remove(ctPath)
 	defer os.Remove(ptPath)
 
-	ctFile, err := os.OpenFile(ctPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
+	if err := e.downloadVerifyPack(head, ctPath, p); err != nil {
 		return "", err
 	}
-	hasher := sha256.New()
-	if err := e.Be.ReadBlob(head, "packs/"+p.ID+".age", io.MultiWriter(ctFile, hasher)); err != nil {
-		ctFile.Close()
+	if err := e.decryptPackTo(ctPath, ptPath); err != nil {
 		return "", err
 	}
-	if err := ctFile.Close(); err != nil {
-		return "", err
-	}
-	if got := hex.EncodeToString(hasher.Sum(nil)); got != p.ID {
-		return "", cloakerr.Newf(cloakerr.Tamper, "verify pack "+short,
-			"ciphertext hash %s does not match manifest id %s", got, p.ID).WithHint(packTamperHint)
-	}
+	return e.indexPackFile(ptPath, short, p.Size)
+}
 
+// decryptPackTo decrypts the age ciphertext at ctPath and writes the
+// plaintext pack to ptPath, classifying AEAD failures as Tamper.
+func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
 	ct, err := os.Open(ctPath)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer ct.Close()
 	plain, err := agecrypt.Decrypt(ct, e.Key)
 	if err != nil {
-		return "", cloakerr.WithHintOn(err, packTamperHint)
+		return cloakerr.WithHintOn(err, packTamperHint)
 	}
 	ptFile, err := os.OpenFile(ptPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if _, err := io.Copy(ptFile, plain); err != nil {
 		ptFile.Close()
-		return "", cloakerr.WithHintOn(err, packTamperHint) // Tamper-classified by agecrypt on AEAD failure
+		return cloakerr.WithHintOn(err, packTamperHint) // Tamper-classified by agecrypt on AEAD failure
 	}
-	if err := ptFile.Close(); err != nil {
-		return "", err
-	}
+	return ptFile.Close()
+}
 
+// indexPackFile feeds the plaintext pack at ptPath to git index-pack in the
+// local repo and returns the .keep file it created (empty if none).
+func (e *Engine) indexPackFile(ptPath, short string, size int64) (keepFile string, err error) {
 	pt, err := os.Open(ptPath)
 	if err != nil {
 		return "", err
@@ -284,7 +355,7 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 	if err != nil {
 		return "", cloakerr.New(cloakerr.LocalGit, "index pack "+short, err)
 	}
-	e.Log.Info("applied pack", "pack", short, "ciphertext_bytes", p.Size)
+	e.Log.Info("applied pack", "pack", short, "ciphertext_bytes", size)
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		kind, hash, found := strings.Cut(strings.TrimSpace(line), "\t")
 		if found && kind == "keep" {
@@ -310,6 +381,13 @@ func HeadForList(m *manifest.Manifest) string {
 			return cand
 		}
 	}
+	return firstBranch(m)
+}
+
+// firstBranch returns the alphabetically-first refs/heads/* ref in the
+// manifest, or "" when the manifest advertises no branches. It is the final
+// fallback for HeadForList once the manifest head and main/master are ruled out.
+func firstBranch(m *manifest.Manifest) string {
 	var branches []string
 	for name := range m.Refs {
 		if strings.HasPrefix(name, "refs/heads/") {

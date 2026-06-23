@@ -20,7 +20,7 @@ func TestForgedManifestRejected(t *testing.T) {
 	a.InitRepo()
 	a.WriteFile("f.md", "real content\n")
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 
 	// Forge a manifest-shaped blob encrypted under a different key.
@@ -59,7 +59,7 @@ func TestSwappedPackBlobsRejected(t *testing.T) {
 	a.MustGit("config", "cloak.geometricFactor", "0")
 	a.WriteFile("a.md", strings.Repeat("alpha ", 2000))
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	a.WriteFile("b.md", strings.Repeat("beta ", 2000))
 	a.Commit("c1")
@@ -115,7 +115,7 @@ func TestManifestRefWithoutObjectRejected(t *testing.T) {
 	a.InitRepo()
 	a.WriteFile("f.md", "real content\n")
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	realOID := a.HeadOID()
 

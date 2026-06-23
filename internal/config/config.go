@@ -45,6 +45,14 @@ func Load(g *gitx.G, gitDir string) (Config, error) {
 		}
 		return c, err
 	}
+	applyConfigLines(&c, out)
+	return c, nil
+}
+
+// applyConfigLines parses `git config --get-regexp` output (one "key value"
+// line per setting) and applies each recognized cloak.* setting to c,
+// skipping blank and value-less lines.
+func applyConfigLines(c *Config, out string) {
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
@@ -53,24 +61,34 @@ func Load(g *gitx.G, gitDir string) (Config, error) {
 		if !found {
 			continue
 		}
-		switch strings.ToLower(key) {
-		case "cloak.keyref":
-			c.KeyRef = val
-		case "cloak.geometricfactor":
-			if n, err := strconv.Atoi(val); err == nil && n >= 0 {
-				c.GeometricFactor = n
-			}
-		case "cloak.pushretries":
-			if n, err := strconv.Atoi(val); err == nil && n > 0 {
-				c.PushRetries = n
-			}
-		case "cloak.branch":
-			if val != "" {
-				c.Branch = val
-			}
-		case "cloak.loglevel":
-			c.LogLevel = val
-		}
+		applyConfigSetting(c, strings.ToLower(key), val)
 	}
-	return c, nil
+}
+
+// applyConfigSetting applies a single cloak.* setting (key already
+// lower-cased, val the raw value) to c, ignoring unknown keys and
+// out-of-range numeric values so the documented default survives.
+func applyConfigSetting(c *Config, key, val string) {
+	switch key {
+	case "cloak.keyref":
+		c.KeyRef = val
+	case "cloak.geometricfactor":
+		setIfValidInt(&c.GeometricFactor, val, 0)
+	case "cloak.pushretries":
+		setIfValidInt(&c.PushRetries, val, 1)
+	case "cloak.branch":
+		if val != "" {
+			c.Branch = val
+		}
+	case "cloak.loglevel":
+		c.LogLevel = val
+	}
+}
+
+// setIfValidInt parses val as a base-10 int and stores it in *dst only
+// when it parses and is at least min, leaving the existing default otherwise.
+func setIfValidInt(dst *int, val string, min int) {
+	if n, err := strconv.Atoi(val); err == nil && n >= min {
+		*dst = n
+	}
 }

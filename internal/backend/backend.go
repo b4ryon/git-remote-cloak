@@ -100,16 +100,7 @@ func (b *Backend) Fetch() (head string, empty bool, err error) {
 	args = append(args, "origin")
 	_, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY()}, args...)
 	if err != nil {
-		low := strings.ToLower(stderr)
-		if b.partial && filterRejectedRe.MatchString(stderr) {
-			b.disablePartial()
-			return b.Fetch()
-		}
-		if strings.Contains(low, "couldn't find remote ref") ||
-			strings.Contains(low, "no matching refs") {
-			return "", true, nil
-		}
-		return "", false, gitx.ClassifyTransport("fetch backend branch", err)
+		return b.classifyFetchErr(stderr, err)
 	}
 	head, err = b.g.Out(gitx.Opts{GitDir: b.gitDir}, "rev-parse", "--verify", remoteHeadRef)
 	if err != nil {
@@ -117,6 +108,23 @@ func (b *Backend) Fetch() (head string, empty bool, err error) {
 		return "", true, nil
 	}
 	return head, false, nil
+}
+
+// classifyFetchErr maps a failed backend fetch to its Fetch result. A rejected
+// partial filter triggers a one-time fallback to a full fetch (retrying the
+// whole operation); a missing remote ref means the repository is empty;
+// anything else is reported as a transport error.
+func (b *Backend) classifyFetchErr(stderr string, err error) (head string, empty bool, _ error) {
+	low := strings.ToLower(stderr)
+	if b.partial && filterRejectedRe.MatchString(stderr) {
+		b.disablePartial()
+		return b.Fetch()
+	}
+	if strings.Contains(low, "couldn't find remote ref") ||
+		strings.Contains(low, "no matching refs") {
+		return "", true, nil
+	}
+	return "", false, gitx.ClassifyTransport("fetch backend branch", err)
 }
 
 // maxManifestBytes bounds how much of a manifest-sized blob ReadBlobBytes will
@@ -218,25 +226,35 @@ type cappingWriter struct {
 }
 
 func (c *cappingWriter) Write(p []byte) (int, error) {
-	if !c.overflow {
-		if room := c.limit - c.n; room < int64(len(p)) {
-			if room > 0 {
-				wn, err := c.w.Write(p[:room])
-				c.n += int64(wn)
-				if err != nil {
-					return wn, err
-				}
-			}
-			c.overflow = true
-		} else {
-			wn, err := c.w.Write(p)
-			c.n += int64(wn)
-			if err != nil {
-				return wn, err
-			}
+	if c.overflow {
+		return len(p), nil
+	}
+	room := c.limit - c.n
+	if room >= int64(len(p)) {
+		// Fits within the cap: forward the whole chunk.
+		if wn, err := c.writeChunk(p); err != nil {
+			return wn, err
+		}
+		return len(p), nil
+	}
+	// Exceeds the cap: forward what still fits, discard the rest, and record
+	// the overflow so later writes are acknowledged but dropped.
+	if room > 0 {
+		if wn, err := c.writeChunk(p[:room]); err != nil {
+			return wn, err
 		}
 	}
+	c.overflow = true
 	return len(p), nil
+}
+
+// writeChunk forwards b to the underlying writer and accumulates the bytes
+// actually written, giving the two Write branches one place to keep n in sync
+// with the destination.
+func (c *cappingWriter) writeChunk(b []byte) (int, error) {
+	wn, err := c.w.Write(b)
+	c.n += int64(wn)
+	return wn, err
 }
 
 // PackBlobOIDs maps pack id -> blob oid for every pack in the commit's
@@ -253,6 +271,14 @@ func (b *Backend) PackBlobOIDs(commit string) (map[string]string, error) {
 		}
 		return nil, cloakerr.New(cloakerr.LocalGit, "list remote pack blobs", err)
 	}
+	return parsePackBlobTree(out), nil
+}
+
+// parsePackBlobTree turns `git ls-tree <commit>:packs` output into a map from
+// pack id (the <id>.age filename with the suffix stripped) to its blob oid,
+// skipping any line that is not a well-formed "100644 blob <oid>\t<id>.age"
+// tree entry.
+func parsePackBlobTree(out string) map[string]string {
 	oids := map[string]string{}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		// Format: "100644 blob <oid>\t<id>.age"
@@ -266,7 +292,7 @@ func (b *Backend) PackBlobOIDs(commit string) (map[string]string, error) {
 		}
 		oids[strings.TrimSuffix(name, ".age")] = fields[2]
 	}
-	return oids, nil
+	return oids
 }
 
 // HashObject writes a blob into the mirror's object store and returns its oid.

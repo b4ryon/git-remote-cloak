@@ -61,83 +61,12 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	defer out.Flush()
 
 	for in.Scan() {
-		line := in.Text()
-		switch {
-		case line == "capabilities":
-			for _, c := range capabilities {
-				fmt.Fprintln(out, c)
-			}
-			fmt.Fprintln(out)
-			out.Flush()
-
-		case strings.HasPrefix(line, "option "):
-			fmt.Fprintln(out, s.option(strings.TrimPrefix(line, "option ")))
-			out.Flush()
-
-		case line == "list" || line == "list for-push":
-			lines, err := s.list(line == "list for-push")
-			if err != nil {
-				return s.fatal(err)
-			}
-			for _, l := range lines {
-				fmt.Fprintln(out, l)
-			}
-			fmt.Fprintln(out)
-			out.Flush()
-
-		case strings.HasPrefix(line, "fetch "):
-			reqs := []string{strings.TrimPrefix(line, "fetch ")}
-			for in.Scan() {
-				l := in.Text()
-				if l == "" {
-					break
-				}
-				if !strings.HasPrefix(l, "fetch ") {
-					return s.fatal(fmt.Errorf("protocol: unexpected %q inside fetch batch", l))
-				}
-				reqs = append(reqs, strings.TrimPrefix(l, "fetch "))
-			}
-			locks, err := s.fetchBatch(reqs)
-			if err != nil {
-				return s.fatal(err)
-			}
-			for _, lk := range locks {
-				fmt.Fprintf(out, "lock %s\n", lk)
-			}
-			fmt.Fprintln(out)
-			out.Flush()
-
-		case strings.HasPrefix(line, "push "):
-			specs := []string{strings.TrimPrefix(line, "push ")}
-			for in.Scan() {
-				l := in.Text()
-				if l == "" {
-					break
-				}
-				if !strings.HasPrefix(l, "push ") {
-					return s.fatal(fmt.Errorf("protocol: unexpected %q inside push batch", l))
-				}
-				specs = append(specs, strings.TrimPrefix(l, "push "))
-			}
-			results, err := s.pushBatch(specs)
-			if err != nil {
-				return s.fatal(err)
-			}
-			for _, r := range results {
-				if r.Err == "" {
-					fmt.Fprintf(out, "ok %s\n", r.Dst)
-				} else {
-					fmt.Fprintf(out, "error %s %s\n", r.Dst, r.Err)
-				}
-			}
-			fmt.Fprintln(out)
-			out.Flush()
-
-		case line == "":
+		done, err := s.dispatchLine(in, out, in.Text())
+		if err != nil {
+			return s.fatal(err)
+		}
+		if done {
 			return 0
-
-		default:
-			return s.fatal(fmt.Errorf("protocol: unknown command %q", line))
 		}
 	}
 	if err := in.Err(); err != nil {
@@ -146,14 +75,71 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// dispatchLine handles a single protocol command line. It returns done=true
+// when the blank line terminates the dialogue (the caller exits cleanly), and
+// any error for the caller to route through fatal. The fetch/push cases pull
+// their continuation lines from in; every other case answers on out directly.
+func (s *session) dispatchLine(in *bufio.Scanner, out *bufio.Writer, line string) (done bool, err error) {
+	switch {
+	case line == "capabilities":
+		s.emitCapabilities(out)
+
+	case strings.HasPrefix(line, "option "):
+		fmt.Fprintln(out, s.option(strings.TrimPrefix(line, "option ")))
+		out.Flush()
+
+	case line == "list" || line == "list for-push":
+		return false, s.handleList(out, line == "list for-push")
+
+	case strings.HasPrefix(line, "fetch "):
+		return false, s.handleFetch(in, out, line)
+
+	case strings.HasPrefix(line, "push "):
+		return false, s.handlePush(in, out, line)
+
+	case line == "":
+		return true, nil
+
+	default:
+		return false, fmt.Errorf("protocol: unknown command %q", line)
+	}
+	return false, nil
+}
+
+// emitCapabilities writes the advertised capabilities followed by the
+// terminating blank line and flushes.
+func (s *session) emitCapabilities(out *bufio.Writer) {
+	for _, c := range capabilities {
+		fmt.Fprintln(out, c)
+	}
+	fmt.Fprintln(out)
+	out.Flush()
+}
+
+// collectBatch reads a contiguous batch of same-prefix protocol lines. first
+// is the batch's opening line (already matched by prefix); subsequent lines are
+// pulled from in until a blank line or EOF. Every line must carry prefix, which
+// is stripped from each collected item. prefix includes its trailing space
+// (e.g. "fetch "), so "inside %sbatch" formats as "inside fetch batch".
+func collectBatch(in *bufio.Scanner, first, prefix string) ([]string, error) {
+	items := []string{strings.TrimPrefix(first, prefix)}
+	for in.Scan() {
+		l := in.Text()
+		if l == "" {
+			break
+		}
+		if !strings.HasPrefix(l, prefix) {
+			return nil, fmt.Errorf("protocol: unexpected %q inside %sbatch", l, prefix)
+		}
+		items = append(items, strings.TrimPrefix(l, prefix))
+	}
+	return items, nil
+}
+
 // fatal reports a classified error on stderr (the protocol-blessed path for
 // fatal failures) and returns the exit code.
 func (s *session) fatal(err error) int {
-	msg := err.Error()
-	if !strings.HasPrefix(msg, "cloak:") {
-		msg = "cloak: " + msg
-	}
-	fmt.Fprintln(s.stderr, msg)
+	fmt.Fprintln(s.stderr, cloakerr.Message(err))
 	// Point at the per-repo debug log for self-service troubleshooting. The
 	// concrete path is only known once the session's state dir is open; before
 	// that, name the conventional location.
@@ -207,6 +193,21 @@ func (s *session) ensure() error {
 	return nil
 }
 
+// handleList answers a "list"/"list for-push" command: it computes the ref
+// advertisement and writes each line plus the terminating blank line to out.
+func (s *session) handleList(out *bufio.Writer, forPush bool) error {
+	lines, err := s.list(forPush)
+	if err != nil {
+		return err
+	}
+	for _, l := range lines {
+		fmt.Fprintln(out, l)
+	}
+	fmt.Fprintln(out)
+	out.Flush()
+	return nil
+}
+
 // list produces the ref advertisement from the validated manifest. For
 // "list for-push" the cached remote state additionally pins the CAS parent
 // the push batch (M3) builds on.
@@ -234,6 +235,26 @@ func (s *session) list(forPush bool) ([]string, error) {
 	return lines, nil
 }
 
+// handleFetch answers a "fetch " batch: it collects the request lines, applies
+// the missing packs, and writes a "lock" line per kept pack plus the
+// terminating blank line to out.
+func (s *session) handleFetch(in *bufio.Scanner, out *bufio.Writer, line string) error {
+	reqs, err := collectBatch(in, line, "fetch ")
+	if err != nil {
+		return err
+	}
+	locks, err := s.fetchBatch(reqs)
+	if err != nil {
+		return err
+	}
+	for _, lk := range locks {
+		fmt.Fprintf(out, "lock %s\n", lk)
+	}
+	fmt.Fprintln(out)
+	out.Flush()
+	return nil
+}
+
 // fetchBatch applies all missing manifest packs, then verifies every object
 // git asked for is now present. Returns .keep lock lines for the protocol.
 func (s *session) fetchBatch(reqs []string) ([]string, error) {
@@ -258,6 +279,30 @@ func (s *session) fetchBatch(reqs []string) ([]string, error) {
 	}
 	s.log.Info("fetch batch complete", "objects", len(reqs), "locks", len(locks))
 	return locks, nil
+}
+
+// handlePush answers a "push " batch: it collects the refspec lines, runs the
+// engine push, and writes an "ok"/"error" line per result plus the terminating
+// blank line to out.
+func (s *session) handlePush(in *bufio.Scanner, out *bufio.Writer, line string) error {
+	specs, err := collectBatch(in, line, "push ")
+	if err != nil {
+		return err
+	}
+	results, err := s.pushBatch(specs)
+	if err != nil {
+		return err
+	}
+	for _, r := range results {
+		if r.Err == "" {
+			fmt.Fprintf(out, "ok %s\n", r.Dst)
+		} else {
+			fmt.Fprintf(out, "error %s %s\n", r.Dst, r.Err)
+		}
+	}
+	fmt.Fprintln(out)
+	out.Flush()
+	return nil
 }
 
 // pushBatch parses the refspecs, runs the engine push against the remote

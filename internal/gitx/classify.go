@@ -59,12 +59,11 @@ func StripServerSideband(stderr string) string {
 // failure is the conservative LocalGit (and Tamper for blob reads), so a
 // host cannot downgrade a withhold into a benign class.
 func ClassifyTransport(op string, err error) error {
+	// A killed (timeout) or aborted (cancel) git subprocess is a stalled or
+	// interrupted transport, never tamper, so both map to the same Network kind.
 	var te *TimeoutError
-	if errors.As(err, &te) {
-		return cloakerr.New(cloakerr.Network, op, err)
-	}
 	var ce *CanceledError
-	if errors.As(err, &ce) {
+	if errors.As(err, &te) || errors.As(err, &ce) {
 		return cloakerr.New(cloakerr.Network, op, err)
 	}
 	var ge *GitError

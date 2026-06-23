@@ -98,6 +98,40 @@ func (d *Dir) TmpDir() string { return filepath.Join(d.Root, "tmp") }
 // LogPath is the per-remote debug log file.
 func (d *Dir) LogPath() string { return filepath.Join(d.Root, "log") }
 
+// readStateFile reads a file under the state directory. ok is false (with a
+// nil error) when the file does not exist yet -- the first-contact case every
+// caller treats as "no record".
+func (d *Dir) readStateFile(name string) ([]byte, bool, error) {
+	b, err := os.ReadFile(filepath.Join(d.Root, name))
+	if os.IsNotExist(err) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
+// writeStateFile atomically replaces the state file destName: it writes the
+// content to tmpName under TmpDir (same filesystem) and renames it into place.
+func (d *Dir) writeStateFile(tmpName, destName string, content []byte) error {
+	tmp := filepath.Join(d.TmpDir(), tmpName)
+	if err := os.WriteFile(tmp, content, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(d.Root, destName))
+}
+
+// removeStateFile deletes the named state file, treating an already-absent
+// file as success so callers can clear a record idempotently.
+func (d *Dir) removeStateFile(name string) error {
+	err := os.Remove(filepath.Join(d.Root, name))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
 // Pin is the rollback-protection record.
 type Pin struct {
 	Generation   uint64
@@ -108,12 +142,9 @@ const pinFile = "generation"
 
 // LoadPin returns the stored pin; ok=false on first contact.
 func (d *Dir) LoadPin() (Pin, bool, error) {
-	b, err := os.ReadFile(filepath.Join(d.Root, pinFile))
-	if os.IsNotExist(err) {
-		return Pin{}, false, nil
-	}
-	if err != nil {
-		return Pin{}, false, err
+	b, ok, err := d.readStateFile(pinFile)
+	if err != nil || !ok {
+		return Pin{}, ok, err
 	}
 	var p Pin
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d %s", &p.Generation, &p.ManifestHash); err != nil {
@@ -124,11 +155,7 @@ func (d *Dir) LoadPin() (Pin, bool, error) {
 
 // SavePin atomically persists the pin.
 func (d *Dir) SavePin(p Pin) error {
-	tmp := filepath.Join(d.TmpDir(), "pin")
-	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d %s\n", p.Generation, p.ManifestHash)), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(d.Root, pinFile))
+	return d.writeStateFile("pin", pinFile, []byte(fmt.Sprintf("%d %s\n", p.Generation, p.ManifestHash)))
 }
 
 // CheckPin enforces rollback protection for a validated remote manifest:
@@ -168,48 +195,29 @@ func (d *Dir) CheckPin(m *manifest.Manifest, manifestHash string) error {
 // ClearPin removes the rollback pin, returning protection to
 // trust-on-first-use for the next fetch. Only `git cloak accept-rollback`
 // calls this; it is deliberately not reachable via configuration.
-func (d *Dir) ClearPin() error {
-	err := os.Remove(filepath.Join(d.Root, pinFile))
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
-}
+func (d *Dir) ClearPin() error { return d.removeStateFile(pinFile) }
 
 const repoIDFile = "repoid"
 
 // LoadRepoID returns the locally pinned repository identity; ok=false on
 // first contact (no pin yet).
 func (d *Dir) LoadRepoID() (string, bool, error) {
-	b, err := os.ReadFile(filepath.Join(d.Root, repoIDFile))
-	if os.IsNotExist(err) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
+	b, ok, err := d.readStateFile(repoIDFile)
+	if err != nil || !ok {
+		return "", ok, err
 	}
 	return strings.TrimSpace(string(b)), true, nil
 }
 
 // SaveRepoID atomically persists the repository-identity pin.
 func (d *Dir) SaveRepoID(id string) error {
-	tmp := filepath.Join(d.TmpDir(), "repoid")
-	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(d.Root, repoIDFile))
+	return d.writeStateFile("repoid", repoIDFile, []byte(id+"\n"))
 }
 
 // ClearRepoID removes the repo-identity pin, returning to trust-on-first-use.
 // Only `git cloak accept-repo-change` calls this; like ClearPin it is not
 // reachable via configuration.
-func (d *Dir) ClearRepoID() error {
-	err := os.Remove(filepath.Join(d.Root, repoIDFile))
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
-}
+func (d *Dir) ClearRepoID() error { return d.removeStateFile(repoIDFile) }
 
 // CheckRepoID enforces repository-identity trust-on-first-use: a missing
 // local pin accepts (the caller pins once the state is fully applied), a
@@ -239,12 +247,12 @@ const appliedFile = "applied"
 // AppliedSet returns the pack ids already indexed into the local repo.
 func (d *Dir) AppliedSet() (map[string]bool, error) {
 	out := map[string]bool{}
-	b, err := os.ReadFile(filepath.Join(d.Root, appliedFile))
-	if os.IsNotExist(err) {
-		return out, nil
-	}
+	b, ok, err := d.readStateFile(appliedFile)
 	if err != nil {
 		return nil, err
+	}
+	if !ok {
+		return out, nil
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		if line = strings.TrimSpace(line); line != "" {

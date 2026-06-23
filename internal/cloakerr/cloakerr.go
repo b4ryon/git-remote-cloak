@@ -9,6 +9,7 @@ package cloakerr
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Kind classifies an error for reporting and retry decisions.
@@ -44,28 +45,30 @@ const (
 	Protocol
 )
 
+// kindInfo holds the per-Kind reporting strings, indexed by Kind so the two
+// reporting paths (String's short token and Error's user-facing prefix) share
+// one source of truth: adding a Kind means adding one row here, not editing two
+// parallel switches. The keyed literal pins each row to its constant, so the
+// slice order cannot drift from the iota block above.
+var kindInfo = [...]struct {
+	token  string
+	prefix string
+}{
+	Auth:           {"auth", "cloak: authentication failed"},
+	Network:        {"network", "cloak: network failure"},
+	RepoNotFound:   {"repo-not-found", "cloak: repository not found"},
+	Tamper:         {"tamper", "cloak: TAMPER ALARM"},
+	Rollback:       {"rollback", "cloak: ROLLBACK ALARM"},
+	CASExhausted:   {"cas-exhausted", "cloak: concurrent-push retries exhausted"},
+	LocalGit:       {"local-git", "cloak: local git failure"},
+	KeyUnavailable: {"key-unavailable", "cloak: master key unavailable"},
+	Crypto:         {"crypto", "cloak: cryptographic failure"},
+	Protocol:       {"protocol", "cloak: incompatible remote"},
+}
+
 func (k Kind) String() string {
-	switch k {
-	case Auth:
-		return "auth"
-	case Network:
-		return "network"
-	case RepoNotFound:
-		return "repo-not-found"
-	case Tamper:
-		return "tamper"
-	case Rollback:
-		return "rollback"
-	case CASExhausted:
-		return "cas-exhausted"
-	case LocalGit:
-		return "local-git"
-	case KeyUnavailable:
-		return "key-unavailable"
-	case Crypto:
-		return "crypto"
-	case Protocol:
-		return "protocol"
+	if k >= 0 && int(k) < len(kindInfo) {
+		return kindInfo[k].token
 	}
 	return fmt.Sprintf("kind(%d)", int(k))
 }
@@ -81,30 +84,9 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	var prefix string
-	switch e.Kind {
-	case Auth:
-		prefix = "cloak: authentication failed"
-	case Network:
-		prefix = "cloak: network failure"
-	case RepoNotFound:
-		prefix = "cloak: repository not found"
-	case Tamper:
-		prefix = "cloak: TAMPER ALARM"
-	case Rollback:
-		prefix = "cloak: ROLLBACK ALARM"
-	case CASExhausted:
-		prefix = "cloak: concurrent-push retries exhausted"
-	case LocalGit:
-		prefix = "cloak: local git failure"
-	case KeyUnavailable:
-		prefix = "cloak: master key unavailable"
-	case Crypto:
-		prefix = "cloak: cryptographic failure"
-	case Protocol:
-		prefix = "cloak: incompatible remote"
-	default:
-		prefix = "cloak: error"
+	prefix := "cloak: error"
+	if k := e.Kind; k >= 0 && int(k) < len(kindInfo) {
+		prefix = kindInfo[k].prefix
 	}
 	msg := prefix
 	if e.Op != "" {
@@ -157,6 +139,18 @@ func WithHintOn(err error, hint string) error {
 		ce.Hint = hint
 	}
 	return err
+}
+
+// Message returns the user-facing text for err, guaranteed to carry the
+// "cloak:" prefix. Errors produced by this package already begin with it
+// (see Error.Error); Message only prepends it for errors from elsewhere, so
+// every reported failure reaches stderr under a uniform prefix.
+func Message(err error) string {
+	msg := err.Error()
+	if !strings.HasPrefix(msg, "cloak:") {
+		msg = "cloak: " + msg
+	}
+	return msg
 }
 
 // KindOf reports the classification of err, if it is (or wraps) an Error.

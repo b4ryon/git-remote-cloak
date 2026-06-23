@@ -33,7 +33,7 @@ func seeded(t *testing.T) (*harness.Host, string, *harness.Client) {
 	a.Commit("commit message with " + sentinel)
 	a.MustGit("branch", "branch-"+sentinel)
 	a.MustGit("tag", "tag-"+sentinel)
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	a.MustGit("push", "origin", "branch-"+sentinel)
 	a.MustGit("push", "origin", "tag-"+sentinel)
@@ -92,7 +92,7 @@ func TestNoKeyMaterialInLogs(t *testing.T) {
 	// Sentinel lives ONLY in file content, never in a ref name.
 	a.WriteFile("doc.md", "top secret body: "+contentSentinel+"\n")
 	a.Commit("ordinary message")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 
 	b := harness.NewClient(t, "b", key)
@@ -156,7 +156,7 @@ func TestNeverPlainForce(t *testing.T) {
 	a.InitRepo()
 	a.WriteFile("f.md", "content\n")
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	// Exercise consolidation (squash via lease) and a normal push.
 	for i := 0; i < 3; i++ {

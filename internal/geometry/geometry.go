@@ -35,6 +35,19 @@ func Victims(packs []manifest.Pack, factor int) []manifest.Pack {
 	sorted := append([]manifest.Pack(nil), packs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Size < sorted[j].Size })
 
+	split := initialSplit(sorted, factor)
+	if split < 1 {
+		return nil
+	}
+	split = extendSplit(sorted, factor, split)
+	return sorted[:split+1]
+}
+
+// initialSplit returns the highest index i (>=1) at which the invariant
+// breaks, i.e. pack i is smaller than factor times the running sum of all
+// strictly-smaller packs, scanning sorted-ascending. It returns -1 when no
+// such violation exists (the invariant already holds).
+func initialSplit(sorted []manifest.Pack, factor int) int {
 	split := -1
 	var cum uint64
 	for i, p := range sorted {
@@ -43,22 +56,24 @@ func Victims(packs []manifest.Pack, factor int) []manifest.Pack {
 		}
 		cum += uint64(p.Size)
 	}
-	if split < 1 {
-		return nil
-	}
+	return split
+}
+
+// extendSplit grows the victim prefix beyond split while each next pack still
+// violates against the running merged sum, returning the final split index.
+func extendSplit(sorted []manifest.Pack, factor, split int) int {
 	var combined uint64
 	for i := 0; i <= split; i++ {
 		combined += uint64(sorted[i].Size)
 	}
 	for j := split + 1; j < len(sorted); j++ {
-		if smaller(sorted[j].Size, factor, combined) {
-			combined += uint64(sorted[j].Size)
-			split = j
-		} else {
+		if !smaller(sorted[j].Size, factor, combined) {
 			break
 		}
+		combined += uint64(sorted[j].Size)
+		split = j
 	}
-	return sorted[:split+1]
+	return split
 }
 
 // Holds reports whether the invariant holds for the given sizes.

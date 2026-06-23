@@ -27,7 +27,7 @@ func bigPushSetup(t *testing.T) (*harness.Host, string, *harness.Client) {
 	}
 	a.WriteFile("big.md", big.String())
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	return host, key, a
 }

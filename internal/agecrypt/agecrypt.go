@@ -90,32 +90,41 @@ type identity struct{ master keystore.Key }
 
 func (i identity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
 	for _, s := range stanzas {
-		if s.Type != StanzaType || len(s.Args) != 1 {
-			continue
+		if fileKey, ok := i.tryUnwrapStanza(s); ok {
+			return fileKey, nil
 		}
-		salt, err := base64.RawStdEncoding.DecodeString(s.Args[0])
-		if err != nil || len(salt) != saltSize {
-			continue
-		}
-		wk, nonce, err := deriveWrapKey(i.master, salt)
-		if err != nil {
-			continue
-		}
-		aead, err := chacha20poly1305.New(wk)
-		if err != nil {
-			zero(wk)
-			continue
-		}
-		fileKey, err := aead.Open(nil, nonce, s.Body, nil)
-		zero(wk)
-		if err != nil {
-			// Wrong master key and a tampered stanza are
-			// indistinguishable here; both end as ErrIncorrectIdentity.
-			continue
-		}
-		return fileKey, nil
 	}
 	return nil, age.ErrIncorrectIdentity
+}
+
+// tryUnwrapStanza attempts to recover the file key from a single stanza,
+// returning ok=false for any stanza this identity cannot open (wrong type,
+// malformed salt, or a failed AEAD open). A wrong master key and a tampered
+// stanza are indistinguishable here, so both leave ok=false; the caller
+// surfaces age.ErrIncorrectIdentity once every stanza is exhausted.
+func (i identity) tryUnwrapStanza(s *age.Stanza) ([]byte, bool) {
+	if s.Type != StanzaType || len(s.Args) != 1 {
+		return nil, false
+	}
+	salt, err := base64.RawStdEncoding.DecodeString(s.Args[0])
+	if err != nil || len(salt) != saltSize {
+		return nil, false
+	}
+	wk, nonce, err := deriveWrapKey(i.master, salt)
+	if err != nil {
+		return nil, false
+	}
+	aead, err := chacha20poly1305.New(wk)
+	if err != nil {
+		zero(wk)
+		return nil, false
+	}
+	fileKey, err := aead.Open(nil, nonce, s.Body, nil)
+	zero(wk)
+	if err != nil {
+		return nil, false
+	}
+	return fileKey, true
 }
 
 // tamper wraps any decrypt-path failure: at the AEAD level a wrong key and

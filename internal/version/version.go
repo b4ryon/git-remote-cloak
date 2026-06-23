@@ -26,8 +26,18 @@ func String() string {
 	if v := bi.Main.Version; v != "" && v != "(devel)" {
 		return v
 	}
+	if rev := vcsRevision(bi.Settings); rev != "" {
+		return rev
+	}
+	return "unknown"
+}
+
+// vcsRevision extracts the VCS revision from build settings, truncated to 12
+// characters and suffixed with "-dirty" when the working tree was modified at
+// build time. It returns "" when no vcs.revision is recorded.
+func vcsRevision(settings []debug.BuildSetting) string {
 	var rev, dirty string
-	for _, s := range bi.Settings {
+	for _, s := range settings {
 		switch s.Key {
 		case "vcs.revision":
 			rev = s.Value
@@ -37,11 +47,11 @@ func String() string {
 			}
 		}
 	}
-	if rev != "" {
-		if len(rev) > 12 {
-			rev = rev[:12]
-		}
-		return rev + dirty
+	if rev == "" {
+		return ""
 	}
-	return "unknown"
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return rev + dirty
 }

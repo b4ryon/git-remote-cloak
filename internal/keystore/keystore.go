@@ -254,9 +254,21 @@ func saveFile(path string, k Key) error {
 		}
 		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
 	}
-	defer f.Close()
+	// The key file is the single most critical artifact: it decrypts every
+	// repo and has no other copy. fsync it to disk before reporting success,
+	// and surface the close error rather than dropping it. On the write/sync
+	// failure paths the best-effort Close is cleanup only -- its error is
+	// subordinate to the failure already being returned.
 	if _, err := f.WriteString(k.Export() + "\n"); err != nil {
+		f.Close()
 		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
 	}
-	return f.Close()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
+	}
+	if err := f.Close(); err != nil {
+		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
+	}
+	return nil
 }

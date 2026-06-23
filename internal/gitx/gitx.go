@@ -112,29 +112,23 @@ func (e *CanceledError) Error() string {
 	return fmt.Sprintf("git %s: canceled", strings.Join(e.Args, " "))
 }
 
-// Run executes git with args. Returns captured stdout (when not streamed)
-// and the captured stderr; err is *GitError on non-zero exit.
-func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
-	ctx := o.Ctx
-	if ctx == nil {
-		if d := defaultTimeout(); d > 0 && !o.Interactive {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(context.Background(), d)
-			defer cancel()
-		} else {
-			ctx = context.Background()
-		}
+// resolveContext picks the deadline context for one invocation. It returns a
+// cancel func that is always safe to defer: a no-op when o.Ctx is supplied or
+// no deadline applies, the real WithTimeout cancel otherwise.
+func resolveContext(o Opts) (context.Context, context.CancelFunc) {
+	if o.Ctx != nil {
+		return o.Ctx, func() {}
 	}
-	// Refuse git's arbitrary-command transports (ext::, fd::) on every git
-	// invocation as defense in depth behind setup's URL validation, so a
-	// malicious cloak:: URL cannot reach them. Harmless for local plumbing.
-	gitArgs := append([]string{
-		"-c", "protocol.ext.allow=never",
-		"-c", "protocol.fd.allow=never",
-	}, args...)
-	cmd := exec.CommandContext(ctx, "git", gitArgs...)
-	cmd.Dir = o.Dir
+	if d := defaultTimeout(); d > 0 && !o.Interactive {
+		return context.WithTimeout(context.Background(), d)
+	}
+	return context.Background(), func() {}
+}
 
+// buildEnv assembles the child process environment: the parent environment
+// with any inherited GIT_DIR dropped, then GIT_DIR/scrub/extra pairs applied
+// per o.
+func buildEnv(o Opts) []string {
 	env := make([]string, 0, len(os.Environ())+4)
 	for _, kv := range os.Environ() {
 		if strings.HasPrefix(kv, "GIT_DIR=") {
@@ -148,8 +142,43 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 	if o.Scrub {
 		env = append(env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	}
-	env = append(env, o.Env...)
-	cmd.Env = env
+	return append(env, o.Env...)
+}
+
+// classifyExit maps a finished invocation to its typed error (nil on success).
+// A deadline/cancel kills the process, so it is surfaced as a *TimeoutError or
+// *CanceledError; the classifier then reports network (a stall), never tamper.
+func classifyExit(args []string, ctxErr, runErr error, exit int, dur time.Duration, stderr string) error {
+	if runErr == nil {
+		return nil
+	}
+	switch ctxErr {
+	case context.DeadlineExceeded:
+		return &TimeoutError{Args: args, Elapsed: dur}
+	case context.Canceled:
+		return &CanceledError{Args: args}
+	}
+	if exit == -1 {
+		return fmt.Errorf("git %s: %w", strings.Join(args, " "), runErr)
+	}
+	return &GitError{Args: args, ExitCode: exit, Stderr: stderr}
+}
+
+// Run executes git with args. Returns captured stdout (when not streamed)
+// and the captured stderr; err is *GitError on non-zero exit.
+func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
+	ctx, cancel := resolveContext(o)
+	defer cancel()
+	// Refuse git's arbitrary-command transports (ext::, fd::) on every git
+	// invocation as defense in depth behind setup's URL validation, so a
+	// malicious cloak:: URL cannot reach them. Harmless for local plumbing.
+	gitArgs := append([]string{
+		"-c", "protocol.ext.allow=never",
+		"-c", "protocol.fd.allow=never",
+	}, args...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd.Dir = o.Dir
+	cmd.Env = buildEnv(o)
 
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdin = o.Stdin
@@ -179,21 +208,7 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 			"gitdir", o.GitDir, "exit", exit, "ms", dur.Milliseconds(),
 			"stderr_bytes", len(stderr))
 	}
-	if runErr != nil {
-		// A deadline/cancel kills the process; surface it as a typed error so
-		// the classifier reports network (a stall), never tamper.
-		switch ctx.Err() {
-		case context.DeadlineExceeded:
-			return stdout, stderr, &TimeoutError{Args: args, Elapsed: dur}
-		case context.Canceled:
-			return stdout, stderr, &CanceledError{Args: args}
-		}
-		if exit == -1 {
-			return stdout, stderr, fmt.Errorf("git %s: %w", strings.Join(args, " "), runErr)
-		}
-		return stdout, stderr, &GitError{Args: args, ExitCode: exit, Stderr: stderr}
-	}
-	return stdout, stderr, nil
+	return stdout, stderr, classifyExit(args, ctx.Err(), runErr, exit, dur, stderr)
 }
 
 // Out runs git and returns whitespace-trimmed stdout.

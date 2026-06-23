@@ -109,8 +109,25 @@ func Decode(b []byte) (*Manifest, error) {
 	return &m, nil
 }
 
-// Validate checks structural invariants.
+// Validate checks structural invariants. It runs the four validation phases
+// in order (meta, refs, packs, replaces), threading the live-pack set built by
+// validatePacks into the Replaces cross-check.
 func (m *Manifest) Validate() error {
+	if err := m.validateMeta(); err != nil {
+		return err
+	}
+	if err := m.validateRefs(); err != nil {
+		return err
+	}
+	seen, err := m.validatePacks()
+	if err != nil {
+		return err
+	}
+	return m.validateReplaces(seen)
+}
+
+// validateMeta checks the version, repo id, and head invariants.
+func (m *Manifest) validateMeta() error {
 	if m.Version != Version {
 		return fmt.Errorf("manifest: unsupported version %d (this build speaks %d)", m.Version, Version)
 	}
@@ -120,6 +137,12 @@ func (m *Manifest) Validate() error {
 	if m.Head != "" && !strings.HasPrefix(m.Head, "refs/heads/") {
 		return fmt.Errorf("manifest: head %q is not a branch ref", m.Head)
 	}
+	return nil
+}
+
+// validateRefs checks that every ref name is under refs/ and every target is a
+// well-formed object id.
+func (m *Manifest) validateRefs() error {
 	for name, oid := range m.Refs {
 		if !strings.HasPrefix(name, "refs/") {
 			return fmt.Errorf("manifest: ref name %q does not start with refs/", name)
@@ -128,35 +151,65 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("manifest: ref %q has malformed object id %q", name, oid)
 		}
 	}
+	return nil
+}
+
+// validatePacks checks the pack count cap and each pack's id (well-formed and
+// unique) and size, returning the set of live pack ids for the Replaces check.
+func (m *Manifest) validatePacks() (map[string]bool, error) {
 	if len(m.Packs) > maxPacks {
-		return fmt.Errorf("manifest: %d packs exceeds maximum %d", len(m.Packs), maxPacks)
+		return nil, fmt.Errorf("manifest: %d packs exceeds maximum %d", len(m.Packs), maxPacks)
 	}
 	seen := make(map[string]bool, len(m.Packs))
 	for _, p := range m.Packs {
-		if !packIDRe.MatchString(p.ID) {
-			return fmt.Errorf("manifest: malformed pack id %q", p.ID)
-		}
-		if seen[p.ID] {
-			return fmt.Errorf("manifest: duplicate pack id %q", p.ID)
-		}
-		seen[p.ID] = true
-		if p.Size < 0 {
-			return fmt.Errorf("manifest: pack %q has negative size %d", p.ID, p.Size)
-		}
-		if p.Size > maxPackSize {
-			return fmt.Errorf("manifest: pack %q size %d exceeds maximum %d", p.ID, p.Size, maxPackSize)
+		if err := validatePack(p, seen); err != nil {
+			return nil, err
 		}
 	}
-	// Replaces ids must be well-formed and must not name a still-live pack: a
-	// pack cannot both be live and superseded.
+	return seen, nil
+}
+
+// validatePack checks one pack's id (well-formed and not already in seen) and
+// size, recording its id in seen. The checks run in id, duplicate, then size
+// order so a pack failing several rules reports the same error as the inline
+// loop did.
+func validatePack(p Pack, seen map[string]bool) error {
+	if !packIDRe.MatchString(p.ID) {
+		return fmt.Errorf("manifest: malformed pack id %q", p.ID)
+	}
+	if seen[p.ID] {
+		return fmt.Errorf("manifest: duplicate pack id %q", p.ID)
+	}
+	seen[p.ID] = true
+	if p.Size < 0 {
+		return fmt.Errorf("manifest: pack %q has negative size %d", p.ID, p.Size)
+	}
+	if p.Size > maxPackSize {
+		return fmt.Errorf("manifest: pack %q size %d exceeds maximum %d", p.ID, p.Size, maxPackSize)
+	}
+	return nil
+}
+
+// validateReplaces checks that every Replaces id is well-formed and does not
+// name a still-live pack: a pack cannot both be live and superseded.
+func (m *Manifest) validateReplaces(seen map[string]bool) error {
 	for _, p := range m.Packs {
-		for _, r := range p.Replaces {
-			if !packIDRe.MatchString(r) {
-				return fmt.Errorf("manifest: pack %q replaces malformed id %q", p.ID, r)
-			}
-			if seen[r] {
-				return fmt.Errorf("manifest: pack %q replaces live pack id %q", p.ID, r)
-			}
+		if err := validatePackReplaces(p, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validatePackReplaces checks one pack's Replaces ids: each must be well-formed
+// and must not name a still-live pack (present in seen).
+func validatePackReplaces(p Pack, seen map[string]bool) error {
+	for _, r := range p.Replaces {
+		if !packIDRe.MatchString(r) {
+			return fmt.Errorf("manifest: pack %q replaces malformed id %q", p.ID, r)
+		}
+		if seen[r] {
+			return fmt.Errorf("manifest: pack %q replaces live pack id %q", p.ID, r)
 		}
 	}
 	return nil

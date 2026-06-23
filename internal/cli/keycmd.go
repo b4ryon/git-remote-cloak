@@ -6,7 +6,6 @@ package cli
 import (
 	"bufio"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"strings"
@@ -27,10 +26,27 @@ func keyExistsGuidance(stderr io.Writer, ref string) {
 	fmt.Fprintln(stderr, "new key instead of deleting.)")
 }
 
+// dispatchKey routes `git cloak key <sub>` to the matching key command. args
+// is the full argv with args[0] == "key"; an unknown or missing subcommand
+// prints the usage line and returns code 2.
+func dispatchKey(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) >= 2 {
+		switch args[1] {
+		case "export":
+			return cmdKeyExport(args[2:], stdout, stderr)
+		case "import":
+			return cmdKeyImport(args[2:], stdin, stdout, stderr)
+		case "delete":
+			return cmdKeyDelete(args[2:], stdin, stdout, stderr)
+		}
+	}
+	fmt.Fprintln(stderr, "cloak: usage: git cloak key export|import|delete [--key <ref>]")
+	return 2
+}
+
 func cmdKeygen(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("keygen", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	ref := fs.String("key", keystore.DefaultRef(), "key reference (file:<path>)")
+	fs := newFlagSet("keygen", stderr)
+	ref := keyFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -40,13 +56,11 @@ func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := userpresence.Require("generate a new master key", stderr); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	k, err := keystore.Generate()
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	defer k.Wipe()
 	if err := keystore.Save(*ref, k); err != nil {
@@ -54,8 +68,7 @@ func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 			keyExistsGuidance(stderr, *ref)
 			return 1
 		}
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	fmt.Fprintf(stdout, "Generated master key %s\n", k.ID())
 	fmt.Fprintf(stdout, "Stored at %s\n", *ref)
@@ -64,9 +77,8 @@ func cmdKeygen(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdKeyExport(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("key export", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	ref := fs.String("key", keystore.DefaultRef(), "key reference (file:<path>)")
+	fs := newFlagSet("key export", stderr)
+	ref := keyFlag(fs)
 	forceInsecure := fs.Bool("force-insecure", false,
 		"allow export when stdin is not a terminal, skipping the user-presence gate (for scripted backups)")
 	if err := fs.Parse(args); err != nil {
@@ -81,13 +93,11 @@ func cmdKeyExport(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := userpresence.Require("export the master key", stderr); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	k, err := keystore.Load(*ref)
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	defer k.Wipe()
 	fmt.Fprintln(stdout, k.Export())
@@ -95,9 +105,8 @@ func cmdKeyExport(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdKeyImport(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("key import", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	ref := fs.String("key", keystore.DefaultRef(), "key reference (file:<path>)")
+	fs := newFlagSet("key import", stderr)
+	ref := keyFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -108,13 +117,11 @@ func cmdKeyImport(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	k, err := keystore.ParseExport(sc.Text())
 	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	defer k.Wipe()
 	if err := keystore.Save(*ref, k); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	fmt.Fprintf(stdout, "Imported master key %s\n", k.ID())
 	fmt.Fprintf(stdout, "Stored at %s\n", *ref)
@@ -122,8 +129,7 @@ func cmdKeyImport(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 }
 
 func cmdKeyDelete(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("key delete", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+	fs := newFlagSet("key delete", stderr)
 	ref := fs.String("key", keystore.DefaultRef(), "key reference (file:<path> or keychain:<name>)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -138,8 +144,7 @@ func cmdKeyDelete(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 		return 1
 	}
 	if err := keystore.Delete(*ref); err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+		return printFail(stderr, err)
 	}
 	fmt.Fprintf(stdout, "Deleted master key at %s\n", *ref)
 	return 0

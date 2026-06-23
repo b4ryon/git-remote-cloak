@@ -52,31 +52,9 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "accept-repo-change":
 		return cmdAcceptRepoChange(args[1:], stdout, stderr)
 	case "key":
-		if len(args) >= 2 {
-			switch args[1] {
-			case "export":
-				return cmdKeyExport(args[2:], stdout, stderr)
-			case "import":
-				return cmdKeyImport(args[2:], stdin, stdout, stderr)
-			case "delete":
-				return cmdKeyDelete(args[2:], stdin, stdout, stderr)
-			}
-		}
-		fmt.Fprintln(stderr, "cloak: usage: git cloak key export|import|delete [--key <ref>]")
-		return 2
+		return dispatchKey(args, stdin, stdout, stderr)
 	case "debug":
-		if len(args) >= 2 {
-			switch args[1] {
-			case "encrypt":
-				return cmdDebugEncrypt(args[2:], stdin, stdout, stderr)
-			case "decrypt":
-				return cmdDebugDecrypt(args[2:], stdin, stdout, stderr)
-			case "seed-remote":
-				return cmdDebugSeedRemote(args[2:], stdout, stderr)
-			}
-		}
-		fmt.Fprintln(stderr, "cloak: usage: git cloak debug encrypt|decrypt|seed-remote [--key <ref>]")
-		return 2
+		return dispatchDebug(args, stdin, stdout, stderr)
 	}
 	fmt.Fprintf(stderr, "cloak: unknown or not yet implemented command %q (see git-cloak --help)\n", args[0])
 	return 2

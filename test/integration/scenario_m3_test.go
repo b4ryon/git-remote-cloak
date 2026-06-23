@@ -26,7 +26,7 @@ func pushSetup(t *testing.T) (*harness.Host, string, *harness.Client) {
 	a.InitRepo()
 	a.WriteFile("readme.md", "initial content\n")
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 	return host, key, a
 }
@@ -73,7 +73,7 @@ func TestScenario1IncrementalPush(t *testing.T) {
 	}
 	a.WriteFile("big.md", big.String())
 	a.Commit("c0")
-	a.MustGit("remote", "add", "origin", "cloak::"+host.Dir)
+	a.AddOrigin(host.Dir)
 	a.MustGit("push", "-u", "origin", "main")
 
 	a.WriteFile("tiny.md", "one small edit\n")

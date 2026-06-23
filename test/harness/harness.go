@@ -30,7 +30,7 @@ func EnsureBuilt() (string, error) {
 			return
 		}
 		bin := filepath.Join(dir, "git-remote-cloak")
-		cmd := exec.Command("go", "build", "-o", bin,
+		cmd := exec.Command("go", "build", "-o", bin, // #nosec G204 -- test harness: fixed binary, test-controlled args
 			"github.com/b4ryon/git-remote-cloak/cmd/git-remote-cloak")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("building helper: %v\n%s", err, out)
