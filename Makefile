@@ -83,13 +83,20 @@ test-e2e: build
 sign: build
 	codesign --force --sign "$(CLOAK_SIGN_ID)" $(BIN)/git-remote-cloak
 
+# go's own work dir (and golangci-lint's lock file) honor the exported
+# TMPDIR (=$(HOME)/tmp), so it must exist even for targets that touch no test
+# files; create it like build/test do. On a fresh CI runner ~/tmp does not
+# exist, which otherwise fails these tools with "creating work dir: ... no such
+# file or directory".
 vet:
+	mkdir -p $(TMPDIR)
 	go vet ./...
 
 # Vulnerability scan of dependencies and reachable stdlib. Install once with:
 #   go install golang.org/x/vuln/cmd/govulncheck@latest
 # Requires network access to the Go vulnerability database (vuln.go.dev).
 vuln:
+	mkdir -p $(TMPDIR)
 	govulncheck ./...
 
 # Stricter static analysis via golangci-lint (errcheck, govet, ineffassign,
@@ -98,6 +105,7 @@ vuln:
 #   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 # CI runs this on GOOS=linux (pure-Go file keystore), where gosec is clean.
 lint:
+	mkdir -p $(TMPDIR)
 	golangci-lint run ./...
 
 # Aggregate gate: vet, lint, vulnerabilities, and every test suite.
