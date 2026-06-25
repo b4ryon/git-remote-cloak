@@ -5,6 +5,8 @@ repository on any ordinary git host. The host sees only opaque
 AEAD-encrypted blobs: no file contents, no filenames, no commit messages,
 no branch names, no history graph. Local repositories stay plain git.
 
+![git-remote-cloak illustration](illustration.png)
+
 ## Good fit
 
 cloak suits small, sensitive, mostly-text repositories shared across a few
