@@ -219,8 +219,14 @@ func NewClient(t *testing.T, name, keyFile string) *Client {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(home, "gitconfig")
+	// gc.auto=0 disables git's automatic `gc --auto`, which on Linux detaches
+	// into the background (gc.autoDetach) and can keep writing to
+	// .git/objects/pack after the foreground porcelain (clone/fetch/pull)
+	// returns. That races t.TempDir()'s RemoveAll and fails cleanup with
+	// "directory not empty" (a flake seen on the Linux CI runner, not darwin).
 	cfg := "[user]\n\tname = cloak-test\n\temail = test@cloak.invalid\n" +
 		"[init]\n\tdefaultBranch = main\n" +
+		"[gc]\n\tauto = 0\n\tautoDetach = false\n" +
 		"[cloak]\n\tkeyRef = file:" + keyFile + "\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
