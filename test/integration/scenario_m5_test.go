@@ -51,6 +51,62 @@ func TestScenario4RollbackInjection(t *testing.T) {
 	}
 }
 
+// A corrupt local rollback pin must never be silently swallowed. Fetch fails
+// closed (CheckPin surfaces "corrupt pin file" rather than downgrading to
+// trust-on-first-use), and accept-rollback -- the recovery command for exactly
+// this situation -- reports the unreadable pin instead of "nothing to accept"
+// while still clearing it so the next fetch recovers.
+func TestCorruptPinSurfacedAndRecoverable(t *testing.T) {
+	host, key, a := pushSetup(t)
+	a.WriteFile("more.md", "second push\n")
+	a.Commit("c1")
+	a.MustGit("push", "origin", "main")
+
+	b := harness.NewClient(t, "b", key)
+	b.MustClone(host.Dir)
+
+	corruptStatePins(t, b)
+
+	// Fail-closed: a corrupt pin must not read as "no pin".
+	if _, stderr, err := b.Git("fetch", "origin"); err == nil {
+		t.Fatalf("fetch accepted a corrupt pin (should fail closed): %s", stderr)
+	} else if !strings.Contains(stderr, "corrupt pin") {
+		t.Fatalf("corrupt pin not surfaced on fetch: %s", stderr)
+	}
+
+	out, errb, err := b.Cloak("accept-rollback", "--remote", "origin")
+	if err != nil {
+		t.Fatalf("accept-rollback failed: %v\n%s", err, errb)
+	}
+	if strings.Contains(out, "nothing to accept") {
+		t.Fatalf("accept-rollback silently swallowed the corrupt pin: %q", out)
+	}
+	if !strings.Contains(out, "Accepted") {
+		t.Fatalf("accept-rollback did not re-pin: %q", out)
+	}
+	if _, _, err := b.Git("fetch", "origin"); err != nil {
+		t.Fatalf("fetch still failing after accept-rollback: %v", err)
+	}
+}
+
+// corruptStatePins overwrites every rollback pin file in the client's per-remote
+// state directories with unparseable content.
+func corruptStatePins(t *testing.T, c *harness.Client) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(c.Dir, ".git", "cloak", "*", "generation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) == 0 {
+		t.Fatal("no rollback pin file found to corrupt")
+	}
+	for _, m := range matches {
+		if err := os.WriteFile(m, []byte("garbage no numbers\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestScenario5CorruptionInjection(t *testing.T) {
 	flip := func(b []byte) []byte {
 		out := append([]byte(nil), b...)

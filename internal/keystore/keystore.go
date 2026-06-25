@@ -234,7 +234,14 @@ func Delete(ref string) error {
 	kind, scheme, rest := classifyRef(ref)
 	switch kind {
 	case refFile:
-		return os.Remove(expandHome(rest))
+		// Wrap with the same operation context and Kind as loadFile/saveFile and
+		// the sibling switch arms, so a failed file delete (missing key, no
+		// permission) surfaces as a classified "delete key file" error instead of
+		// a bare os.PathError - the only delete branch that previously leaked one.
+		if err := os.Remove(expandHome(rest)); err != nil {
+			return cloakerr.New(cloakerr.KeyUnavailable, "delete key file", err)
+		}
+		return nil
 	case refKeychain:
 		if !keychainAvailable {
 			return cloakerr.Newf(cloakerr.KeyUnavailable, "delete key", "no Keychain support in this build")

@@ -8,8 +8,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -69,6 +72,26 @@ func TestPackWriterAbortRemovesFile(t *testing.T) {
 	pw.Abort()
 	if _, err := os.Stat(pw.Path()); !os.IsNotExist(err) {
 		t.Fatalf("temp file still present after Abort: %v", err)
+	}
+}
+
+// TestNewPackWriterCreateTempErrorCarriesContext proves the pack encryptor's
+// scratch-file creation failure carries operation context (clause-2 wrapping),
+// not just a bare OS path. A missing scratch dir makes os.CreateTemp fail
+// deterministically; a bare error would surface only "open <path>: ..." with no
+// indication it is the pack encryption step, which buildPack/consolidate/seed
+// all propagate verbatim.
+func TestNewPackWriterCreateTempErrorCarriesContext(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	_, err := NewPackWriter(missing, testKey(t))
+	if err == nil {
+		t.Fatal("expected error for missing scratch dir, got nil")
+	}
+	if !strings.Contains(err.Error(), "create pack encryption scratch file") {
+		t.Fatalf("error %q missing operation context", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error %v does not unwrap to os.ErrNotExist", err)
 	}
 }
 

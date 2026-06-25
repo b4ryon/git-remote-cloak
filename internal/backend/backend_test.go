@@ -4,6 +4,7 @@
 package backend
 
 import (
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -19,6 +20,33 @@ func open(t *testing.T) *Backend {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestIsMissingPacksTree pins the sentinel detection PackBlobOIDs uses to tell a
+// manifest-only commit (no packs/ subtree -> empty pack set) apart from a real
+// ls-tree failure (surface it as LocalGit). The wrapped-error case is the
+// regression guard: the prior direct type assertion (err.(*gitx.GitError))
+// returned false for a wrapped GitError, which would have escalated a benign
+// "no packs subtree" into a hard error and failed the push; errors.As sees
+// through the wrap.
+func TestIsMissingPacksTree(t *testing.T) {
+	missing := &gitx.GitError{Args: []string{"ls-tree"}, Stderr: "fatal: Not a valid object name HEAD:packs"}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"bare missing subtree", missing, true},
+		{"wrapped missing subtree", fmt.Errorf("list remote pack blobs: %w", missing), true},
+		{"other git failure", &gitx.GitError{Args: []string{"ls-tree"}, Stderr: "fatal: not a git repository"}, false},
+		{"non-git error", fmt.Errorf("some other error"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isMissingPacksTree(c.err); got != c.want {
+			t.Errorf("%s: isMissingPacksTree = %v, want %v", c.name, got, c.want)
+		}
+	}
 }
 
 func TestBuildCommitDeterministic(t *testing.T) {

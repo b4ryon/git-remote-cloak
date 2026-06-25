@@ -107,7 +107,7 @@ func (d *Dir) readStateFile(name string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("read state file %q: %w", name, err)
 	}
 	return b, true, nil
 }
@@ -117,9 +117,12 @@ func (d *Dir) readStateFile(name string) ([]byte, bool, error) {
 func (d *Dir) writeStateFile(tmpName, destName string, content []byte) error {
 	tmp := filepath.Join(d.TmpDir(), tmpName)
 	if err := os.WriteFile(tmp, content, 0o600); err != nil {
-		return err
+		return fmt.Errorf("write state file %q: %w", destName, err)
 	}
-	return os.Rename(tmp, filepath.Join(d.Root, destName))
+	if err := os.Rename(tmp, filepath.Join(d.Root, destName)); err != nil {
+		return fmt.Errorf("write state file %q: %w", destName, err)
+	}
+	return nil
 }
 
 // removeStateFile deletes the named state file, treating an already-absent
@@ -129,7 +132,10 @@ func (d *Dir) removeStateFile(name string) error {
 	if os.IsNotExist(err) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("remove state file %q: %w", name, err)
+	}
+	return nil
 }
 
 // Pin is the rollback-protection record.
@@ -269,13 +275,16 @@ func (d *Dir) MarkApplied(ids ...string) error {
 	}
 	f, err := os.OpenFile(filepath.Join(d.Root, appliedFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return fmt.Errorf("append to state file %q: %w", appliedFile, err)
 	}
 	defer f.Close()
 	for _, id := range ids {
 		if _, err := fmt.Fprintln(f, id); err != nil {
-			return err
+			return fmt.Errorf("append to state file %q: %w", appliedFile, err)
 		}
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("append to state file %q: %w", appliedFile, err)
+	}
+	return nil
 }

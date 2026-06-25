@@ -7,6 +7,7 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,32 @@ func TestKeyImportRejectsGarbage(t *testing.T) {
 	}
 	if code, _, _ := run(t, []string{"key", "import", "--key", ref}, ""); code == 0 {
 		t.Fatal("import accepted empty stdin")
+	}
+}
+
+// failingReader returns a non-EOF error on Read, so bufio.Scanner.Scan()
+// stops with sc.Err() != nil - the broken-stdin path key import must surface
+// rather than misreport as "no key on stdin".
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestKeyImportSurfacesStdinReadError(t *testing.T) {
+	ref := "file:" + filepath.Join(t.TempDir(), "key")
+	sentinel := errors.New("stdin pipe broke")
+	var out, errb bytes.Buffer
+	code := cmdKeyImport([]string{"--key", ref}, failingReader{sentinel}, &out, &errb)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if strings.Contains(errb.String(), "no key on stdin") {
+		t.Fatalf("read error misreported as empty stdin: %q", errb.String())
+	}
+	if !strings.Contains(errb.String(), "read key from stdin") || !strings.Contains(errb.String(), sentinel.Error()) {
+		t.Fatalf("stderr does not surface the read error: %q", errb.String())
+	}
+	if _, err := os.Stat(ref[len("file:"):]); err == nil {
+		t.Fatal("a key file was written despite the stdin read failure")
 	}
 }
 

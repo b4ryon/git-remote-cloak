@@ -25,7 +25,7 @@ import (
 func (e *Engine) consolidate(cur *RemoteState, plan *pushPlan, victims []manifest.Pack) error {
 	scratch, err := os.MkdirTemp(e.St.TmpDir(), "scratch-")
 	if err != nil {
-		return err
+		return fmt.Errorf("create consolidation scratch dir: %w", err)
 	}
 	defer os.RemoveAll(scratch)
 	scratchGit := filepath.Join(scratch, "odb.git")
@@ -171,7 +171,7 @@ func (e *Engine) indexPackInto(gitDir, head string, p manifest.Pack, localPath s
 	}
 	ct, err := os.Open(ctPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("open pack ciphertext scratch file %q: %w", ctPath, err)
 	}
 	defer ct.Close()
 	plain, err := agecrypt.Decrypt(ct, e.Key)

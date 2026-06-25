@@ -47,13 +47,20 @@ func printManifestStatus(sess *setup.Session, stdout, stderr io.Writer) int {
 	}
 	appliedLive := countAppliedLive(m.Packs, applied)
 
-	pin, pinned, _ := sess.St.LoadPin()
+	pin, pinned, err := sess.St.LoadPin()
+	if err != nil {
+		return cliFailLogged(stderr, sess, err)
+	}
 	if pinned {
 		fmt.Fprintf(stdout, "Generation: %d (last verified on this machine: %d, manifest %.12s)\n", m.Generation, pin.Generation, pin.ManifestHash)
 	} else {
 		fmt.Fprintf(stdout, "Generation: %d (nothing verified on this machine yet)\n", m.Generation)
 	}
-	if rid, ok, _ := sess.St.LoadRepoID(); ok {
+	rid, ridOK, err := sess.St.LoadRepoID()
+	if err != nil {
+		return cliFailLogged(stderr, sess, err)
+	}
+	if ridOK {
 		note := "matches this machine's record"
 		if rid != m.RepoID {
 			note = "DIFFERS from this machine's record"
@@ -172,9 +179,15 @@ func cmdAcceptRollback(args []string, stdout, stderr io.Writer) int {
 		noun:        "pin",
 		repinFail:   "re-pinning the current state failed",
 		describe: func(sess *setup.Session) {
-			if pin, ok, _ := sess.St.LoadPin(); ok {
+			// A corrupt/unreadable pin is exactly what accept-rollback exists to
+			// clear, so surface the load error instead of silently reporting
+			// "nothing to accept"; clear() below still discards it.
+			switch pin, ok, err := sess.St.LoadPin(); {
+			case err != nil:
+				fmt.Fprintf(stdout, "Discarding unreadable rollback pin (%v).\n", err)
+			case ok:
 				fmt.Fprintf(stdout, "Discarding rollback pin: generation %d, manifest %.12s\n", pin.Generation, pin.ManifestHash)
-			} else {
+			default:
 				fmt.Fprintln(stdout, "No rollback pin was set (nothing to accept).")
 			}
 		},
@@ -197,9 +210,12 @@ func cmdAcceptRepoChange(args []string, stdout, stderr io.Writer) int {
 		noun:        "repo-id pin",
 		repinFail:   "re-pinning failed",
 		describe: func(sess *setup.Session) {
-			if rid, ok, _ := sess.St.LoadRepoID(); ok {
+			switch rid, ok, err := sess.St.LoadRepoID(); {
+			case err != nil:
+				fmt.Fprintf(stdout, "Discarding unreadable repo-id pin (%v).\n", err)
+			case ok:
 				fmt.Fprintf(stdout, "Discarding pinned repo id: %s\n", rid)
-			} else {
+			default:
 				fmt.Fprintln(stdout, "No repo id was pinned (nothing to accept).")
 			}
 		},

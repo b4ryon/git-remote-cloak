@@ -133,6 +133,16 @@ func collectBatch(in *bufio.Scanner, first, prefix string) ([]string, error) {
 		}
 		items = append(items, strings.TrimPrefix(l, prefix))
 	}
+	// Scan() returns false on a read failure exactly as it does on a clean
+	// end-of-batch (a >1 MiB line -> bufio.ErrTooLong, or a broken stdin pipe),
+	// so consult Err(): surface a genuine read error here, before the partial
+	// batch is applied, instead of silently treating the truncated batch as
+	// complete (which for push would partially execute and report "ok" for the
+	// refs that made it in). Clean EOF leaves Err() nil and is accepted, like
+	// the Main loop's own in.Err() check.
+	if err := in.Err(); err != nil {
+		return nil, fmt.Errorf("protocol: reading %sbatch: %w", prefix, err)
+	}
 	return items, nil
 }
 

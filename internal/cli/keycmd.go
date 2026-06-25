@@ -112,6 +112,14 @@ func cmdKeyImport(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	sc := bufio.NewScanner(stdin)
 	if !sc.Scan() {
+		// Scan() returns false on a clean EOF (genuinely empty stdin) AND on a
+		// real read failure (e.g. a >64KiB line -> bufio.ErrTooLong, or a broken
+		// stdin pipe). Surface the latter via sc.Err() instead of misreporting it
+		// as "no key on stdin", so a failed read of a present key is not silently
+		// swallowed as absence.
+		if err := sc.Err(); err != nil {
+			return printFail(stderr, fmt.Errorf("cloak: read key from stdin: %w", err))
+		}
 		fmt.Fprintln(stderr, "cloak: no key on stdin (paste the output of: git cloak key export)")
 		return 1
 	}

@@ -7,6 +7,7 @@ package agecrypt
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -40,7 +41,7 @@ func (c counting) Write(p []byte) (int, error) {
 func NewPackWriter(dir string, master keystore.Key) (*PackWriter, error) {
 	f, err := os.CreateTemp(dir, "enc-*")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create pack encryption scratch file in %q: %w", dir, err)
 	}
 	pw := &PackWriter{f: f, hasher: sha256.New()}
 	w, err := Encrypt(counting{pw}, master)
@@ -66,7 +67,10 @@ func (p *PackWriter) Close() error {
 		p.f.Close()
 		return err
 	}
-	return p.f.Close()
+	if err := p.f.Close(); err != nil {
+		return fmt.Errorf("close pack encryption scratch file %q: %w", p.f.Name(), err)
+	}
+	return nil
 }
 
 // Abort removes the temp file (call when the pack is not used).

@@ -80,7 +80,7 @@ func (s *seeder) run(from string, stdout io.Writer) error {
 	// never land on a separate, possibly non-encrypted volume.
 	work, err := os.MkdirTemp(fromGitDir, "cloak-seed-")
 	if err != nil {
-		return err
+		return fmt.Errorf("create seed scratch dir under %q: %w", fromGitDir, err)
 	}
 	defer os.RemoveAll(work)
 
@@ -208,12 +208,7 @@ func (s *seeder) pushSeedCommit(work string, m *manifest.Manifest, manifestCT []
 	if err != nil {
 		return err
 	}
-	packFile, err := os.Open(pw.Path())
-	if err != nil {
-		return err
-	}
-	packOID, err := be.HashObject(packFile)
-	packFile.Close()
+	packOID, err := hashPackFile(be, pw.Path())
 	if err != nil {
 		return err
 	}
@@ -229,4 +224,24 @@ func (s *seeder) pushSeedCommit(work string, m *manifest.Manifest, manifestCT []
 		return fmt.Errorf("seed push rejected (remote not empty?)")
 	}
 	return nil
+}
+
+// hashPackFile opens the encrypted pack scratch file at path, hashes it into
+// the backend object store, and returns its oid. The file is read-only, so its
+// Close error is surfaced only when the hash itself succeeded (otherwise the
+// real failure is the HashObject error). Both leaf-IO failures carry operation
+// context, matching the engine's scratch-IO wrapping.
+func hashPackFile(be *backend.Backend, path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open pack scratch file %q: %w", path, err)
+	}
+	oid, err := be.HashObject(f)
+	if cerr := f.Close(); err == nil && cerr != nil {
+		err = fmt.Errorf("close pack scratch file %q: %w", path, cerr)
+	}
+	if err != nil {
+		return "", err
+	}
+	return oid, nil
 }

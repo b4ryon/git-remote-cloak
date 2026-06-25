@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 
@@ -40,13 +41,26 @@ func Load(g *gitx.G, gitDir string) (Config, error) {
 	c := Defaults()
 	out, _, err := g.Run(gitx.Opts{GitDir: gitDir}, "config", "--get-regexp", `^cloak\.`)
 	if err != nil {
-		if ge, ok := err.(*gitx.GitError); ok && ge.ExitCode == 1 {
+		if isNoMatchingKeys(err) {
 			return c, nil // no cloak.* keys set
 		}
 		return c, err
 	}
 	applyConfigLines(&c, out)
 	return c, nil
+}
+
+// isNoMatchingKeys reports whether err is git config's "no key matched the
+// pattern" outcome: a *gitx.GitError with exit code 1. Every other exit code is
+// a real failure git config could not complete, which Load must surface rather
+// than silently returning defaults. The detection goes through errors.As (not a
+// direct type assertion) so it still recognizes the sentinel if the error is
+// ever wrapped further up the call chain, matching the errors.As idiom the rest
+// of the codebase already uses for typed git errors; an unrecognized error type
+// falls through and the failure is reported.
+func isNoMatchingKeys(err error) bool {
+	var ge *gitx.GitError
+	return errors.As(err, &ge) && ge.ExitCode == 1
 }
 
 // applyConfigLines parses `git config --get-regexp` output (one "key value"

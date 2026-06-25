@@ -8,6 +8,7 @@ package engine
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -295,7 +296,7 @@ const packTamperHint = "the manifest decrypted under this key but this pack did 
 func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error {
 	f, err := os.OpenFile(ctPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return fmt.Errorf("create pack ciphertext scratch file %q: %w", ctPath, err)
 	}
 	hasher := sha256.New()
 	if err := e.Be.ReadBlob(head, "packs/"+p.ID+".age", io.MultiWriter(f, hasher)); err != nil {
@@ -303,7 +304,7 @@ func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error 
 		return err
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return fmt.Errorf("close pack ciphertext scratch file %q: %w", ctPath, err)
 	}
 	if got := hex.EncodeToString(hasher.Sum(nil)); got != p.ID {
 		return cloakerr.Newf(cloakerr.Tamper, "verify pack "+p.ID[:12],
@@ -335,7 +336,7 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
 	ct, err := os.Open(ctPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("open pack ciphertext scratch file %q: %w", ctPath, err)
 	}
 	defer ct.Close()
 	plain, err := agecrypt.Decrypt(ct, e.Key)
@@ -344,13 +345,16 @@ func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
 	}
 	ptFile, err := os.OpenFile(ptPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return fmt.Errorf("create pack plaintext scratch file %q: %w", ptPath, err)
 	}
 	if _, err := io.Copy(ptFile, plain); err != nil {
 		ptFile.Close()
 		return cloakerr.WithHintOn(err, packTamperHint) // Tamper-classified by agecrypt on AEAD failure
 	}
-	return ptFile.Close()
+	if err := ptFile.Close(); err != nil {
+		return fmt.Errorf("close pack plaintext scratch file %q: %w", ptPath, err)
+	}
+	return nil
 }
 
 // indexPackFile feeds the plaintext pack at ptPath to git index-pack in the
@@ -358,7 +362,7 @@ func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
 func (e *Engine) indexPackFile(ptPath, short string, size int64) (keepFile string, err error) {
 	pt, err := os.Open(ptPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("open pack plaintext scratch file %q: %w", ptPath, err)
 	}
 	defer pt.Close()
 	out, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir, Stdin: pt},

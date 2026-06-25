@@ -266,12 +266,25 @@ func (b *Backend) PackBlobOIDs(commit string) (map[string]string, error) {
 	}
 	out, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir}, "ls-tree", commit+":packs")
 	if err != nil {
-		if ge, ok := err.(*gitx.GitError); ok && strings.Contains(ge.Stderr, "Not a valid object name") {
+		if isMissingPacksTree(err) {
 			return map[string]string{}, nil
 		}
 		return nil, cloakerr.New(cloakerr.LocalGit, "list remote pack blobs", err)
 	}
 	return parsePackBlobTree(out), nil
+}
+
+// isMissingPacksTree reports whether err is the "this commit carries no packs/
+// subtree" outcome of `git ls-tree <commit>:packs` (a manifest-only commit),
+// which is a normal empty-pack-set result, not a failure. It matches git's "Not
+// a valid object name" stderr and goes through errors.As (not a direct type
+// assertion) so it still recognizes the sentinel if the error is ever wrapped
+// further up the call chain, matching the errors.As idiom classifyBlobRead in
+// this package already uses. Any other failure falls through and is reported as
+// LocalGit, never silently collapsed to "no packs".
+func isMissingPacksTree(err error) bool {
+	var ge *gitx.GitError
+	return errors.As(err, &ge) && strings.Contains(ge.Stderr, "Not a valid object name")
 }
 
 // parsePackBlobTree turns `git ls-tree <commit>:packs` output into a map from

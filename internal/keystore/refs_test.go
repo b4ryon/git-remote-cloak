@@ -4,10 +4,13 @@
 package keystore
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 )
 
 func TestLoadSaveDeleteRejectMalformedRefs(t *testing.T) {
@@ -45,6 +48,30 @@ func TestDeleteFileBackend(t *testing.T) {
 	}
 	if err := Delete(ref); err == nil {
 		t.Fatal("Delete of a missing key file reported success")
+	}
+}
+
+// TestDeleteFileBackendErrorCarriesContext asserts the file Delete branch wraps
+// its os.Remove failure with the same operation context and Kind as
+// loadFile/saveFile, rather than leaking a bare os.PathError. Deleting a missing
+// key file is the deterministic trigger; the assertion checks for the "delete
+// key file" phrase the wrap adds (a bare os.Remove error never contains it, so
+// this would false-pass against the unwrapped code) plus chain preservation and
+// classification.
+func TestDeleteFileBackendErrorCarriesContext(t *testing.T) {
+	ref := "file:" + filepath.Join(t.TempDir(), "absent")
+	err := Delete(ref)
+	if err == nil {
+		t.Fatal("Delete of a missing key file reported success")
+	}
+	if !strings.Contains(err.Error(), "delete key file") {
+		t.Errorf("error %q lacks the 'delete key file' operation context", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("error %q does not unwrap to os.ErrNotExist", err)
+	}
+	if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.KeyUnavailable {
+		t.Errorf("error %q not classified KeyUnavailable (kind=%v ok=%v)", err, kind, ok)
 	}
 }
 

@@ -626,7 +626,7 @@ func retainLivePackBlobs(packOIDs map[string]string, live map[string]bool) {
 func (e *Engine) hashPackBlob(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("open pack ciphertext scratch file %q: %w", path, err)
 	}
 	defer f.Close()
 	return e.Be.HashObject(f)
