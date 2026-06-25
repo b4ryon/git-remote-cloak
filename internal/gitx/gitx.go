@@ -25,7 +25,18 @@ const defaultGitTimeout = 120 * time.Second
 // overrides it with a Go duration (e.g. "30s", "5m"); "0" or "off" disables
 // the deadline. An unparseable value falls back to the default.
 func defaultTimeout() time.Duration {
-	v := strings.TrimSpace(os.Getenv("CLOAK_GIT_TIMEOUT"))
+	return parseTimeout(os.Getenv("CLOAK_GIT_TIMEOUT"))
+}
+
+// parseTimeout maps a raw CLOAK_GIT_TIMEOUT value to a deadline. The empty
+// string (unset) and any unparseable or non-positive duration fall back to the
+// default bound; "0" or "off" (case-insensitive, surrounding space trimmed)
+// explicitly disable the deadline. The result is therefore never negative, and
+// is 0 only for those explicit opt-out tokens, so a stalled host stays bounded
+// unless the operator deliberately turns the deadline off. Split out from
+// defaultTimeout so the env-free parse is fuzz-reachable.
+func parseTimeout(raw string) time.Duration {
+	v := strings.TrimSpace(raw)
 	switch {
 	case v == "":
 		return defaultGitTimeout
@@ -129,8 +140,19 @@ func resolveContext(o Opts) (context.Context, context.CancelFunc) {
 // with any inherited GIT_DIR dropped, then GIT_DIR/scrub/extra pairs applied
 // per o.
 func buildEnv(o Opts) []string {
-	env := make([]string, 0, len(os.Environ())+4)
-	for _, kv := range os.Environ() {
+	return applyGitEnv(os.Environ(), o)
+}
+
+// applyGitEnv builds the child git environment from a parent environment and
+// the invocation options. It drops every inherited GIT_DIR= entry (so a stray
+// GIT_DIR in cloak's own environment can never silently redirect the git
+// subprocess to the wrong object store), then sets GIT_DIR from o.GitDir when
+// non-empty, appends the config-scrubbing pair when o.Scrub, and appends o.Env
+// verbatim. Pure (the os.Environ() read stays in buildEnv) so the GIT_DIR
+// isolation contract is fuzz-reachable without touching the process environment.
+func applyGitEnv(parent []string, o Opts) []string {
+	env := make([]string, 0, len(parent)+4)
+	for _, kv := range parent {
 		if strings.HasPrefix(kv, "GIT_DIR=") {
 			continue
 		}

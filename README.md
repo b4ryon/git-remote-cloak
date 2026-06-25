@@ -75,7 +75,7 @@ shell:
 
 ```
 export PATH="$HOME/bin:$PATH"  # put this in ~/.zshrc / ~/.bashrc, then open a NEW shell
-git cloak version              # verify the CLI: prints v0.2.0
+git cloak version              # verify the CLI: prints v0.2.1
 command -v git-remote-cloak    # verify git can find the helper for cloak:: URLs
                                # (must print a path; if empty, the PATH is wrong)
 ```
@@ -86,7 +86,7 @@ later `git clone cloak::...` fails with "helper not found". The full end-to-end
 check is a `cloak::` clone (or `git ls-remote cloak::<your-host>`) once you have
 a key and a host repo configured.
 
-Alternative: `go install github.com/b4ryon/git-remote-cloak/cmd/git-remote-cloak@v0.2.0`,
+Alternative: `go install github.com/b4ryon/git-remote-cloak/cmd/git-remote-cloak@v0.2.1`,
 then `ln -sf git-remote-cloak "$(go env GOPATH)/bin/git-cloak"`.
 
 ### First repository

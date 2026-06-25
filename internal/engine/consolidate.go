@@ -58,21 +58,40 @@ func (e *Engine) indexVictims(scratchGit string, cur *RemoteState, plan *pushPla
 	if err != nil {
 		return nil, false, err
 	}
-	canMark := true
-	victimIDs := make([]string, 0, len(victims))
+	victimIDs, canMark := canMarkConsolidated(victims, plan.packID, applied)
 	for _, v := range victims {
-		victimIDs = append(victimIDs, v.ID)
 		localPath := ""
 		if v.ID == plan.packID {
 			localPath = plan.packPath
-		} else if !applied[v.ID] {
-			canMark = false
 		}
 		if err := e.indexPackInto(scratchGit, cur.Head, v, localPath); err != nil {
 			return nil, false, err
 		}
 	}
 	return victimIDs, canMark, nil
+}
+
+// canMarkConsolidated returns the victim ids in order and reports whether the
+// merged consolidation pack may be recorded as already applied. The merged
+// pack's objects are all guaranteed present locally only when every victim is
+// either the not-yet-pushed pack (notYetPushedID, sourced from disk and packed
+// from objects the local repo already holds) or was already applied; otherwise
+// some victim's objects were never indexed locally, so the merged pack must NOT
+// be marked applied or a future fetch would skip downloading it (packSkippable
+// treats an applied pack as covered) and those objects would stay missing
+// forever, since the applied set is never re-examined. Pure -- the per-victim
+// scratch indexing stays in indexVictims -- so the gate is testable without a
+// git host.
+func canMarkConsolidated(victims []manifest.Pack, notYetPushedID string, applied map[string]bool) (victimIDs []string, canMark bool) {
+	victimIDs = make([]string, 0, len(victims))
+	canMark = true
+	for _, v := range victims {
+		victimIDs = append(victimIDs, v.ID)
+		if v.ID != notYetPushedID && !applied[v.ID] {
+			canMark = false
+		}
+	}
+	return victimIDs, canMark
 }
 
 // packConsolidated enumerates every object now in the scratch repository and
@@ -101,27 +120,39 @@ func (e *Engine) packConsolidated(scratchGit string) (*agecrypt.PackWriter, erro
 // the new pack carrying their ids as Replaces, removes the superseded local
 // ciphertext, and re-validates the resulting manifest.
 func (e *Engine) applyConsolidation(plan *pushPlan, pw *agecrypt.PackWriter, victimIDs []string, canMark bool) error {
-	inVictims := map[string]bool{}
-	for _, id := range victimIDs {
-		inVictims[id] = true
-	}
-	var liveSurvivors []manifest.Pack
-	for _, p := range plan.man.Packs {
-		if !inVictims[p.ID] {
-			liveSurvivors = append(liveSurvivors, p)
-		}
-	}
 	if plan.packPath != "" {
 		_ = os.Remove(plan.packPath)
 	}
-	plan.man.Packs = append(liveSurvivors,
-		manifest.Pack{ID: pw.ID(), Size: pw.Size(), Replaces: victimIDs})
+	plan.man.Packs = consolidatedPacks(plan.man.Packs, victimIDs, pw.ID(), pw.Size())
 	plan.packID, plan.packPath, plan.packSize = pw.ID(), pw.Path(), pw.Size()
 	plan.markApplied = canMark
 	if err := plan.man.Validate(); err != nil {
 		return fmt.Errorf("consolidated manifest invalid (bug): %w", err)
 	}
 	return nil
+}
+
+// consolidatedPacks computes the live pack set for a geometric consolidation:
+// it drops the victim packs from packs and appends the single merged pack
+// (identified by id and ciphertext size) carrying every victim id as Replaces,
+// so a client that already applied the folded packs skips re-downloading the
+// merged one (packSkippable). Non-victim packs are retained in their original
+// order and the merged pack is appended last. Pure (the os.Remove of the
+// superseded local ciphertext stays in applyConsolidation), so the pack-set
+// transformation is testable without a git host or a real PackWriter.
+func consolidatedPacks(packs []manifest.Pack, victimIDs []string, id string, size int64) []manifest.Pack {
+	inVictims := map[string]bool{}
+	for _, vid := range victimIDs {
+		inVictims[vid] = true
+	}
+	var liveSurvivors []manifest.Pack
+	for _, p := range packs {
+		if !inVictims[p.ID] {
+			liveSurvivors = append(liveSurvivors, p)
+		}
+	}
+	return append(liveSurvivors,
+		manifest.Pack{ID: id, Size: size, Replaces: victimIDs})
 }
 
 // indexPackInto verifies, decrypts, and indexes one manifest pack into the
@@ -203,7 +234,7 @@ func (e *Engine) repackOnce(cur *RemoteState, key keystore.Key, rekeyed bool, at
 	if err != nil {
 		return repackAttempt{}, err
 	}
-	man := repackManifest(cur, pw)
+	man := repackManifest(cur, pw.ID(), pw.Size())
 	res, bc, err := e.commitAndPushRepack(cur, man, pw, key)
 	if err != nil {
 		return repackAttempt{}, err
@@ -273,15 +304,18 @@ func (e *Engine) repackPack(cur *RemoteState, key keystore.Key) (*agecrypt.PackW
 
 // repackManifest builds the next-generation manifest for a full repack: a clone
 // of cur's manifest with the generation bumped and its pack set replaced by the
-// single merged pack pw, carrying every prior pack id as Replaces.
-func repackManifest(cur *RemoteState, pw *agecrypt.PackWriter) *manifest.Manifest {
+// single merged pack (identified by id and ciphertext size), carrying every
+// prior pack id as Replaces. Taking the merged pack's id/size directly (rather
+// than the *agecrypt.PackWriter) keeps this a pure manifest-construction
+// function the caller passes pw.ID()/pw.Size() into.
+func repackManifest(cur *RemoteState, id string, size int64) *manifest.Manifest {
 	oldIDs := make([]string, 0, len(cur.Manifest.Packs))
 	for _, p := range cur.Manifest.Packs {
 		oldIDs = append(oldIDs, p.ID)
 	}
 	man := cur.Manifest.Clone()
 	man.Generation++
-	man.Packs = []manifest.Pack{{ID: pw.ID(), Size: pw.Size(), Replaces: oldIDs}}
+	man.Packs = []manifest.Pack{{ID: id, Size: size, Replaces: oldIDs}}
 	return man
 }
 

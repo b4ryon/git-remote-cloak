@@ -311,33 +311,47 @@ func (e *Engine) buildPlanPack(wants []string, remoteRefs map[string]string) (*p
 // identity on first push), wires in newRefs and any pack from plan, validates
 // it, and stores it on plan. A validation failure aborts the plan's pack.
 func (e *Engine) assembleManifest(curMan *manifest.Manifest, newRefs map[string]string, plan *pushPlan) error {
-	man := manifest.New()
-	if curMan != nil {
-		man = curMan.Clone()
-	} else {
+	base := curMan
+	if base == nil {
 		// First push to an empty remote: mint this repository's identity,
 		// bound inside the AEAD manifest and pinned locally on success.
 		id, err := manifest.NewRepoID()
 		if err != nil {
 			return cloakerr.New(cloakerr.Crypto, "mint repo id", err)
 		}
-		man.RepoID = id
+		base = manifest.New()
+		base.RepoID = id
 		// cloak hides contents but not the repo's existence, name, owner, or
 		// push metadata; the helper cannot verify host privacy over plain git.
 		e.Log.Warn("creating a new cloak backend on this remote; ensure the host repository is PRIVATE (cloak hides contents, not the repo's existence/name/owner or push timing and sizes)")
 	}
-	man.Generation++
-	man.Refs = newRefs
-	man.Head = e.headForManifest(curMan, newRefs)
-	if plan.packID != "" {
-		man.Packs = append(man.Packs, manifest.Pack{ID: plan.packID, Size: plan.packSize})
-	}
+	man := nextPushManifest(base, newRefs, e.headForManifest(curMan, newRefs), plan.packID, plan.packSize)
 	if err := man.Validate(); err != nil {
 		plan.abort()
 		return fmt.Errorf("constructed manifest invalid (bug): %w", err)
 	}
 	plan.man = man
 	return nil
+}
+
+// nextPushManifest builds the next-generation push manifest from base (the
+// current remote manifest, or a freshly minted one carrying only the new RepoID
+// on the first push). It clones base so the cached remote state is never
+// mutated, bumps the rollback generation by exactly one, installs the new ref
+// set and head, and appends the new pack when packID != "" while RETAINING
+// every pack base already carried (in order): a normal push adds a pack, it
+// never drops a live one, so clients keep access to the objects those packs
+// hold. This is the normal-push counterpart to repackManifest, which instead
+// replaces the whole pack set with a single merged pack.
+func nextPushManifest(base *manifest.Manifest, newRefs map[string]string, head, packID string, packSize int64) *manifest.Manifest {
+	man := base.Clone()
+	man.Generation++
+	man.Refs = newRefs
+	man.Head = head
+	if packID != "" {
+		man.Packs = append(man.Packs, manifest.Pack{ID: packID, Size: packSize})
+	}
+	return man
 }
 
 // decideRef evaluates one push refspec against the current remote refs without
@@ -369,15 +383,26 @@ func (e *Engine) decideRef(u RefUpdate, remoteRefs map[string]string) (res RefRe
 	return RefResult{u.Dst, ""}, true, false, refOID
 }
 
+// fastForwardExempt reports whether publishing refOID over the remote's current
+// u.Dst may be accepted without an ancestry check: the ref is new on the remote,
+// the push is forced, or the remote tip is already refOID (a no-op). When it
+// returns false the update changes an existing ref's tip without force, so it is
+// a potential history rewrite and the caller MUST run the HaveObject/merge-base
+// ancestry test before accepting it.
+func fastForwardExempt(u RefUpdate, remoteRefs map[string]string, refOID string) bool {
+	old, exists := remoteRefs[u.Dst]
+	return !exists || u.Force || old == refOID
+}
+
 // nonFastForwardReason reports why publishing refOID over the remote's current
 // u.Dst would not be a fast-forward, or "" when the update is allowed (the ref
 // is new, the push is forced, the tip is unchanged, or it is a true
 // fast-forward). oid is the peeled commit used for the ancestry test.
 func (e *Engine) nonFastForwardReason(u RefUpdate, remoteRefs map[string]string, oid, refOID string) string {
-	old, exists := remoteRefs[u.Dst]
-	if !exists || u.Force || old == refOID {
+	if fastForwardExempt(u, remoteRefs, refOID) {
 		return ""
 	}
+	old := remoteRefs[u.Dst]
 	if !e.HaveObject(old) {
 		return "fetch first"
 	}
@@ -473,9 +498,24 @@ func (s *packHeadSniffer) count() uint32 {
 }
 
 // headForManifest picks the manifest head: the local HEAD's branch when it
-// is among the refs, else the previous head if still valid, else empty.
+// is among the refs, else the previous head if still valid, else empty. The
+// one git query (the local HEAD symref) is resolved here; selectManifestHead
+// makes the pure selection so it is fuzz-reachable without a git host.
 func (e *Engine) headForManifest(prev *manifest.Manifest, refs map[string]string) string {
-	if local, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "symbolic-ref", "-q", "HEAD"); err == nil {
+	local, err := e.G.Out(gitx.Opts{GitDir: e.LocalGitDir}, "symbolic-ref", "-q", "HEAD")
+	return selectManifestHead(local, err == nil, prev, refs)
+}
+
+// selectManifestHead chooses the head to publish in the manifest from the local
+// HEAD symref (local, meaningful only when localOK), the previous manifest
+// (prev, may be nil), and the ref set being published (refs). The local HEAD's
+// branch wins when it is among refs; otherwise the previous head is reused when
+// it is still among refs; otherwise there is no head. The result is therefore
+// always "" or a ref that refs actually carries -- the head must never name a
+// ref the manifest does not hold, or "list" would advertise (and clone would
+// check out) a HEAD that does not exist.
+func selectManifestHead(local string, localOK bool, prev *manifest.Manifest, refs map[string]string) string {
+	if localOK {
 		if _, ok := refs[local]; ok {
 			return local
 		}
@@ -556,12 +596,7 @@ func (e *Engine) treePackBlobs(in commitInput) (map[string]string, error) {
 		return nil, err
 	}
 	// Keep only blobs for packs still live in the manifest.
-	live := in.man.PackIDs()
-	for id := range packOIDs {
-		if !live[id] {
-			delete(packOIDs, id)
-		}
-	}
+	retainLivePackBlobs(packOIDs, in.man.PackIDs())
 	if in.packID != "" {
 		oid, err := e.hashPackBlob(in.packPath)
 		if err != nil {
@@ -570,6 +605,20 @@ func (e *Engine) treePackBlobs(in commitInput) (map[string]string, error) {
 		packOIDs[in.packID] = oid
 	}
 	return packOIDs, nil
+}
+
+// retainLivePackBlobs drops from packOIDs (the host's existing-commit pack-blob
+// map, parsed from the backend tree) every entry whose pack id is not live in
+// the current manifest. A reused blob is only ever carried into the next commit
+// tree for a pack the manifest still declares live, so a superseded or
+// host-injected blob for a non-live id can never enter the published tree. It
+// mutates packOIDs in place.
+func retainLivePackBlobs(packOIDs map[string]string, live map[string]bool) {
+	for id := range packOIDs {
+		if !live[id] {
+			delete(packOIDs, id)
+		}
+	}
 }
 
 // hashPackBlob opens the new pack ciphertext at path and returns the blob oid

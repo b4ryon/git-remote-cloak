@@ -247,12 +247,27 @@ func (s *session) handleFetch(in *bufio.Scanner, out *bufio.Writer, line string)
 	if err != nil {
 		return err
 	}
-	for _, lk := range locks {
-		fmt.Fprintf(out, "lock %s\n", lk)
+	for _, l := range fetchLockLines(locks) {
+		fmt.Fprintln(out, l)
 	}
 	fmt.Fprintln(out)
 	out.Flush()
 	return nil
+}
+
+// fetchLockLines formats the .keep lock paths into the protocol's per-pack
+// "lock <path>" lines, one line per lock in order. The caller writes each line
+// followed by the terminating blank line. git reads these lines one at a time
+// to learn which packfiles the helper has locked for the duration of the fetch,
+// so the one-line-per-lock framing is the contract that keeps each lock
+// attributable to the right path. This mirrors pushReportLines, the push-side
+// status-report formatter.
+func fetchLockLines(locks []string) []string {
+	lines := make([]string, 0, len(locks))
+	for _, lk := range locks {
+		lines = append(lines, "lock "+lk)
+	}
+	return lines
 }
 
 // fetchBatch applies all missing manifest packs, then verifies every object
@@ -293,16 +308,48 @@ func (s *session) handlePush(in *bufio.Scanner, out *bufio.Writer, line string) 
 	if err != nil {
 		return err
 	}
-	for _, r := range results {
-		if r.Err == "" {
-			fmt.Fprintf(out, "ok %s\n", r.Dst)
-		} else {
-			fmt.Fprintf(out, "error %s %s\n", r.Dst, r.Err)
-		}
+	for _, l := range pushReportLines(results) {
+		fmt.Fprintln(out, l)
 	}
 	fmt.Fprintln(out)
 	out.Flush()
 	return nil
+}
+
+// pushReportLines formats the per-ref push outcomes into the protocol status
+// report: "ok <dst>" for an accepted ref (Err == "") and "error <dst> <err>"
+// otherwise, one line per result in input order. The caller writes each line
+// followed by the terminating blank line. git reads this report one line at a
+// time to attribute success or failure to each ref it asked to push, so the
+// framing is the contract that lets it map each outcome to the right ref.
+func pushReportLines(results []engine.RefResult) []string {
+	lines := make([]string, 0, len(results))
+	for _, r := range results {
+		if r.Err == "" {
+			lines = append(lines, "ok "+r.Dst)
+		} else {
+			lines = append(lines, "error "+r.Dst+" "+r.Err)
+		}
+	}
+	return lines
+}
+
+// parseRefUpdate parses one "push" refspec line into a RefUpdate. A leading
+// "+" forces this update; forceAll forces every update regardless. The remainder
+// is "src:dst" with a non-empty dst, where an empty src requests deleting dst.
+// On a malformed spec the error names the spec with any leading "+" stripped,
+// matching what the surrounding batch parser reports.
+func parseRefUpdate(spec string, forceAll bool) (engine.RefUpdate, error) {
+	force := forceAll
+	if strings.HasPrefix(spec, "+") {
+		force = true
+		spec = spec[1:]
+	}
+	src, dst, found := strings.Cut(spec, ":")
+	if !found || dst == "" {
+		return engine.RefUpdate{}, fmt.Errorf("protocol: malformed push refspec %q", spec)
+	}
+	return engine.RefUpdate{Src: src, Dst: dst, Force: force}, nil
 }
 
 // pushBatch parses the refspecs, runs the engine push against the remote
@@ -314,16 +361,11 @@ func (s *session) pushBatch(specs []string) ([]engine.RefResult, error) {
 	}
 	updates := make([]engine.RefUpdate, 0, len(specs))
 	for _, spec := range specs {
-		force := s.forceAll
-		if strings.HasPrefix(spec, "+") {
-			force = true
-			spec = spec[1:]
+		u, err := parseRefUpdate(spec, s.forceAll)
+		if err != nil {
+			return nil, err
 		}
-		src, dst, found := strings.Cut(spec, ":")
-		if !found || dst == "" {
-			return nil, fmt.Errorf("protocol: malformed push refspec %q", spec)
-		}
-		updates = append(updates, engine.RefUpdate{Src: src, Dst: dst, Force: force})
+		updates = append(updates, u)
 	}
 	results, newRS, err := s.eng.Push(s.rs, updates, s.dryRun)
 	if err != nil {

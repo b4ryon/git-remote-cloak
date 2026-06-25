@@ -148,18 +148,47 @@ func FileDefaultRef() string {
 	return "file:" + filepath.Join(home, ".config", "cloak", "keys", "default")
 }
 
+// refKind classifies a key reference's transport scheme. Load, Save, and
+// Delete share this single decision so the three operations always route a
+// given reference to the same backend (or reject it identically) -- a drift
+// between them could, for example, save a key under one backend while delete
+// looks in another and silently leaves key material behind.
+type refKind int
+
+const (
+	refMalformed refKind = iota // no ":" separator -> not a key reference at all
+	refFile                     // file:<path>
+	refKeychain                 // keychain:<name>
+	refUnknown                  // a ":"-bearing reference whose scheme is unrecognized
+)
+
+// classifyRef splits ref on its first ":" and classifies the scheme. scheme is
+// the portion before that first ":" (the whole reference when there is none);
+// rest is the portion after it (the file path or keychain name), empty for a
+// malformed reference. Only an exact "file"/"keychain" scheme selects a
+// backend; everything else fails closed (refMalformed or refUnknown).
+func classifyRef(ref string) (refKind, string, string) {
+	scheme, rest, found := strings.Cut(ref, ":")
+	switch {
+	case !found:
+		return refMalformed, scheme, rest
+	case scheme == "file":
+		return refFile, scheme, rest
+	case scheme == "keychain":
+		return refKeychain, scheme, rest
+	default:
+		return refUnknown, scheme, rest
+	}
+}
+
 // Load resolves a key reference ("file:<path>" or "keychain:<name>") and
 // loads the key.
 func Load(ref string) (Key, error) {
-	scheme, rest, found := strings.Cut(ref, ":")
-	if !found {
-		return Key{}, cloakerr.Newf(cloakerr.KeyUnavailable, "load key",
-			"malformed key reference %q (want file:<path> or keychain:<name>)", ref)
-	}
-	switch scheme {
-	case "file":
+	kind, scheme, rest := classifyRef(ref)
+	switch kind {
+	case refFile:
 		return loadFile(expandHome(rest))
-	case "keychain":
+	case refKeychain:
 		if !keychainAvailable {
 			return Key{}, cloakerr.Newf(cloakerr.KeyUnavailable, "load key",
 				"this build has no Keychain support (non-darwin or cgo disabled); use file:<path>")
@@ -169,6 +198,9 @@ func Load(ref string) (Key, error) {
 			return Key{}, err
 		}
 		return ParseExport(string(b))
+	case refMalformed:
+		return Key{}, cloakerr.Newf(cloakerr.KeyUnavailable, "load key",
+			"malformed key reference %q (want file:<path> or keychain:<name>)", ref)
 	default:
 		return Key{}, cloakerr.Newf(cloakerr.KeyUnavailable, "load key",
 			"unknown key reference scheme %q", scheme)
@@ -178,20 +210,19 @@ func Load(ref string) (Key, error) {
 // Save stores the key at the given reference. Both backends refuse to
 // overwrite an existing key.
 func Save(ref string, k Key) error {
-	scheme, rest, found := strings.Cut(ref, ":")
-	if !found {
-		return cloakerr.Newf(cloakerr.KeyUnavailable, "save key",
-			"malformed key reference %q", ref)
-	}
-	switch scheme {
-	case "file":
+	kind, scheme, rest := classifyRef(ref)
+	switch kind {
+	case refFile:
 		return saveFile(expandHome(rest), k)
-	case "keychain":
+	case refKeychain:
 		if !keychainAvailable {
 			return cloakerr.Newf(cloakerr.KeyUnavailable, "save key",
 				"this build has no Keychain support (non-darwin or cgo disabled); use file:<path>")
 		}
 		return keychainSave(rest, []byte(k.Export()))
+	case refMalformed:
+		return cloakerr.Newf(cloakerr.KeyUnavailable, "save key",
+			"malformed key reference %q", ref)
 	default:
 		return cloakerr.Newf(cloakerr.KeyUnavailable, "save key",
 			"unknown key reference scheme %q", scheme)
@@ -200,18 +231,17 @@ func Save(ref string, k Key) error {
 
 // Delete removes a stored key (used by tests and key rotation cleanup).
 func Delete(ref string) error {
-	scheme, rest, found := strings.Cut(ref, ":")
-	if !found {
-		return cloakerr.Newf(cloakerr.KeyUnavailable, "delete key", "malformed key reference %q", ref)
-	}
-	switch scheme {
-	case "file":
+	kind, scheme, rest := classifyRef(ref)
+	switch kind {
+	case refFile:
 		return os.Remove(expandHome(rest))
-	case "keychain":
+	case refKeychain:
 		if !keychainAvailable {
 			return cloakerr.Newf(cloakerr.KeyUnavailable, "delete key", "no Keychain support in this build")
 		}
 		return keychainDelete(rest)
+	case refMalformed:
+		return cloakerr.Newf(cloakerr.KeyUnavailable, "delete key", "malformed key reference %q", ref)
 	default:
 		return cloakerr.Newf(cloakerr.KeyUnavailable, "delete key", "unknown key reference scheme %q", scheme)
 	}

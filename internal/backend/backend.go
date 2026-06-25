@@ -305,10 +305,12 @@ func (b *Backend) HashObject(r io.Reader) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-// BuildCommit assembles the backend tree (manifest.age at the root, pack
-// blobs under packs/) and creates a commit with deterministic identity and
-// generation-derived timestamps. parent="" creates a root (squash) commit.
-func (b *Backend) BuildCommit(parent, manifestOID string, packs map[string]string, generation uint64) (string, error) {
+// packTreeText serializes the pack-blob map into the `git mktree` input for the
+// packs/ subtree: one "100644 blob <oid>\t<id>.age" entry per pack id, sorted by
+// id so the same pack set always yields a byte-identical tree (and thus a
+// reproducible commit identity, the compare-and-swap push relies on). It is the
+// exact write-side inverse of parsePackBlobTree.
+func packTreeText(packs map[string]string) string {
 	var packTree strings.Builder
 	ids := make([]string, 0, len(packs))
 	for id := range packs {
@@ -318,8 +320,15 @@ func (b *Backend) BuildCommit(parent, manifestOID string, packs map[string]strin
 	for _, id := range ids {
 		fmt.Fprintf(&packTree, "100644 blob %s\t%s.age\n", packs[id], id)
 	}
+	return packTree.String()
+}
+
+// BuildCommit assembles the backend tree (manifest.age at the root, pack
+// blobs under packs/) and creates a commit with deterministic identity and
+// generation-derived timestamps. parent="" creates a root (squash) commit.
+func (b *Backend) BuildCommit(parent, manifestOID string, packs map[string]string, generation uint64) (string, error) {
 	packTreeOID, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Scrub: true,
-		Stdin: strings.NewReader(packTree.String())}, "mktree")
+		Stdin: strings.NewReader(packTreeText(packs))}, "mktree")
 	if err != nil {
 		return "", cloakerr.New(cloakerr.LocalGit, "mktree packs", err)
 	}
@@ -389,18 +398,43 @@ func pushArgs(branch, commit, lease string) []string {
 func (b *Backend) push(commit, lease string) (PushResult, error) {
 	args := pushArgs(b.branch, commit, lease)
 	stdout, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY()}, args...)
-	if err == nil {
+	switch res, marker := classifyPushResult(stdout, stderr, err); res {
+	case PushOK:
 		return PushOK, nil
+	case PushCASLost:
+		b.log.Info("backend push lost compare-and-swap", "marker", marker)
+		return PushCASLost, nil
+	default:
+		return PushFailed, gitx.ClassifyTransport("push backend branch", err)
+	}
+}
+
+// casLostMarkers are the substrings git prints (to stdout or stderr) when a push
+// loses the compare-and-swap: the remote branch moved between discovery and the
+// update, so the helper must re-fetch and retry rather than report a hard
+// failure. The match is case-insensitive (the combined output is lowercased
+// first), so these are written in lower case.
+var casLostMarkers = []string{
+	"non-fast-forward", "fetch first", "stale info",
+	"cannot lock ref", "failed to update ref",
+}
+
+// classifyPushResult maps a backend push's outcome to a PushResult. runErr is
+// the error git's push returned (nil means it succeeded, which short-circuits
+// to PushOK before any output is scanned). On failure it scans the combined
+// lowercased stdout/stderr for the first compare-and-swap-lost marker; the
+// returned marker names the matched one (empty unless the result is
+// PushCASLost) so the caller can log which signal it saw. A PushFailed result
+// carries no marker and lets the caller classify the transport error.
+func classifyPushResult(stdout, stderr string, runErr error) (res PushResult, marker string) {
+	if runErr == nil {
+		return PushOK, ""
 	}
 	combined := strings.ToLower(stdout + "\n" + stderr)
-	for _, marker := range []string{
-		"non-fast-forward", "fetch first", "stale info",
-		"cannot lock ref", "failed to update ref",
-	} {
-		if strings.Contains(combined, marker) {
-			b.log.Info("backend push lost compare-and-swap", "marker", marker)
-			return PushCASLost, nil
+	for _, m := range casLostMarkers {
+		if strings.Contains(combined, m) {
+			return PushCASLost, m
 		}
 	}
-	return PushFailed, gitx.ClassifyTransport("push backend branch", err)
+	return PushFailed, ""
 }

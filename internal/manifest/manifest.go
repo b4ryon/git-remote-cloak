@@ -12,8 +12,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Version is the manifest schema version this build reads and writes. v1
@@ -38,6 +40,26 @@ var (
 	oidRe    = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	repoIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
+
+// hasAdvertUnsafeByte reports whether s contains an ASCII control character
+// (including newline and carriage return) or a space. The helper builds git's
+// line-oriented ref advertisement by formatting "<oid> <name>" and "@<head>
+// HEAD" one per line (internal/helper list), so a ref name or head carrying a
+// newline would inject a forged advertisement line into git's protocol stream,
+// and a space would be misparsed as the start of a ref attribute. All such bytes
+// are also forbidden in git ref names, so an honest manifest never contains one;
+// the manifest is the advertisement's root of trust, so it must reject them.
+// Every flagged byte is < 0x21 or == 0x7f (pure ASCII), and this runs only after
+// utf8.ValidString, so a valid multi-byte UTF-8 rune (continuation bytes >= 0x80)
+// is never falsely flagged.
+func hasAdvertUnsafeByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] <= ' ' || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
 
 // Pack describes one live encrypted packfile on the remote.
 type Pack struct {
@@ -100,6 +122,16 @@ func Decode(b []byte) (*Manifest, error) {
 	if err := dec.Decode(&m); err != nil {
 		return nil, fmt.Errorf("manifest: %w", err)
 	}
+	// An honest manifest is exactly one JSON object: Encode emits a single
+	// compact json.Marshal value with no trailing bytes. json.Decoder.Decode
+	// reads only the first value and would silently ignore anything after it,
+	// so a second object or arbitrary bytes appended past the manifest would
+	// pass unnoticed. Require the stream to end (modulo JSON whitespace, which
+	// json.Unmarshal also tolerates) so trailing data cannot be smuggled past
+	// clients, mirroring the DisallowUnknownFields anti-smuggling guard above.
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, fmt.Errorf("manifest: unexpected trailing data after manifest object")
+	}
 	if m.Refs == nil {
 		m.Refs = map[string]string{}
 	}
@@ -137,6 +169,17 @@ func (m *Manifest) validateMeta() error {
 	if m.Head != "" && !strings.HasPrefix(m.Head, "refs/heads/") {
 		return fmt.Errorf("manifest: head %q is not a branch ref", m.Head)
 	}
+	// The manifest is JSON, which cannot represent non-UTF-8 strings: encoding a
+	// branch name with invalid UTF-8 would silently coerce it to U+FFFD and
+	// corrupt the stored head. Fail closed instead so the write is faithful.
+	if !utf8.ValidString(m.Head) {
+		return fmt.Errorf("manifest: head %q is not valid UTF-8", m.Head)
+	}
+	// The head is emitted as "@<head> HEAD" in the ref advertisement, so a
+	// control character or space in it would corrupt git's protocol stream.
+	if hasAdvertUnsafeByte(m.Head) {
+		return fmt.Errorf("manifest: head %q contains a control character or space", m.Head)
+	}
 	return nil
 }
 
@@ -146,6 +189,18 @@ func (m *Manifest) validateRefs() error {
 	for name, oid := range m.Refs {
 		if !strings.HasPrefix(name, "refs/") {
 			return fmt.Errorf("manifest: ref name %q does not start with refs/", name)
+		}
+		// JSON cannot faithfully represent a non-UTF-8 ref name: marshaling
+		// would replace the invalid bytes with U+FFFD and silently corrupt the
+		// stored ref. Reject it so the manifest stays a faithful copy.
+		if !utf8.ValidString(name) {
+			return fmt.Errorf("manifest: ref name %q is not valid UTF-8", name)
+		}
+		// A ref name becomes "<oid> <name>" on its own advertisement line, so a
+		// control character (notably a newline) or space would inject or corrupt
+		// a line in git's protocol stream. Reject it at the root of trust.
+		if hasAdvertUnsafeByte(name) {
+			return fmt.Errorf("manifest: ref name %q contains a control character or space", name)
 		}
 		if !oidRe.MatchString(oid) {
 			return fmt.Errorf("manifest: ref %q has malformed object id %q", name, oid)
@@ -224,16 +279,22 @@ func (m *Manifest) PackIDs() map[string]bool {
 	return out
 }
 
-// Clone returns a deep copy.
+// Clone returns a deep copy. A nil Packs is preserved as nil (rather than
+// normalized to an empty slice) so a clone re-encodes byte-for-byte identically
+// to its source ("packs":null vs "packs":[]) and reflect.DeepEqual(m, m.Clone())
+// holds; this mirrors how each pack's Replaces slice is already nil-preserving.
 func (m *Manifest) Clone() *Manifest {
 	c := &Manifest{Version: m.Version, RepoID: m.RepoID, Generation: m.Generation, Head: m.Head,
-		Refs: make(map[string]string, len(m.Refs)), Packs: make([]Pack, 0, len(m.Packs))}
+		Refs: make(map[string]string, len(m.Refs))}
 	for k, v := range m.Refs {
 		c.Refs[k] = v
 	}
-	for _, p := range m.Packs {
-		cp := Pack{ID: p.ID, Size: p.Size, Replaces: append([]string(nil), p.Replaces...)}
-		c.Packs = append(c.Packs, cp)
+	if m.Packs != nil {
+		c.Packs = make([]Pack, 0, len(m.Packs))
+		for _, p := range m.Packs {
+			cp := Pack{ID: p.ID, Size: p.Size, Replaces: append([]string(nil), p.Replaces...)}
+			c.Packs = append(c.Packs, cp)
+		}
 	}
 	return c
 }

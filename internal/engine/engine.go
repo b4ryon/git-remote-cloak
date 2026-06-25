@@ -155,12 +155,23 @@ func (e *Engine) HasObjectClosure(oids []string) bool {
 	if err != nil {
 		return false
 	}
+	return !revListReportsMissing(out)
+}
+
+// revListReportsMissing reports whether git rev-list --objects --missing=print
+// output names any missing object: a line that, after trimming surrounding
+// whitespace, begins with "?". HasObjectClosure treats any such line as the
+// closure being incomplete and fails safe by downloading the pack instead, so a
+// parse that under-reports a "?" line would skip a download the local repo
+// actually needs. Extracted as a pure function so it can be fuzzed without a
+// git host.
+func revListReportsMissing(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "?") {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // FetchApply downloads and indexes every manifest pack the local repo has
@@ -356,13 +367,26 @@ func (e *Engine) indexPackFile(ptPath, short string, size int64) (keepFile strin
 		return "", cloakerr.New(cloakerr.LocalGit, "index pack "+short, err)
 	}
 	e.Log.Info("applied pack", "pack", short, "ciphertext_bytes", size)
+	return keepFileFromIndexPack(e.LocalGitDir, out), nil
+}
+
+// keepFileFromIndexPack parses `git index-pack --keep=cloak` stdout for the
+// first "keep\t<hash>" line and returns the matching .keep lock-file path
+// (gitDir/objects/pack/pack-<hash>.keep), or "" when no keep line is present.
+// index-pack prints exactly one such line per kept pack ("keep" then a tab then
+// the pack sha); the returned path is what the helper reports to git as the
+// fetch "lock" line (helper.go handleFetch), the marker that stops git from
+// garbage-collecting the just-applied pack, so a mis-parse would drop a lock git
+// needs or name the wrong file. Extracted from indexPackFile (behavior-
+// preserving) so the parse is fuzz-reachable without a git host.
+func keepFileFromIndexPack(gitDir, out string) string {
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		kind, hash, found := strings.Cut(strings.TrimSpace(line), "\t")
 		if found && kind == "keep" {
-			return filepath.Join(e.LocalGitDir, "objects", "pack", "pack-"+hash+".keep"), nil
+			return filepath.Join(gitDir, "objects", "pack", "pack-"+hash+".keep")
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // HeadForList resolves the symref target to advertise for HEAD: the

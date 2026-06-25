@@ -111,8 +111,26 @@ func (s *seeder) collectSeedRefs(fromGitDir string) (refs map[string]string, wan
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("list source refs: %w", err)
 	}
+	refs, wants = parseSeedRefs(refsOut)
+	if len(refs) == 0 {
+		return nil, nil, "", fmt.Errorf("source repository has no refs to seed")
+	}
+	head, _ = s.g.Out(gitx.Opts{GitDir: fromGitDir}, "symbolic-ref", "HEAD")
+	return refs, wants, head, nil
+}
+
+// parseSeedRefs parses `git for-each-ref --format=%(objectname) %(refname)`
+// output into the seed manifest's ref name->oid map plus the ordered want
+// oids handed to pack-objects. Each line is trimmed and split on its first
+// space into "<oid> <name>"; a line with no space or an empty oid is skipped
+// (blank lines, and any non-ref noise git might interleave). A duplicate name
+// keeps the last oid (map assignment), while wants carries one oid per
+// accepted line in order (pack-objects treats the revision list as a set, so
+// duplicate oids are harmless). Extracted as a pure function so the manifest's
+// ref construction is fuzzable without a source git repository.
+func parseSeedRefs(out string) (refs map[string]string, wants []string) {
 	refs = map[string]string{}
-	for _, line := range strings.Split(refsOut, "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		oid, name, found := strings.Cut(strings.TrimSpace(line), " ")
 		if !found || oid == "" {
 			continue
@@ -120,11 +138,7 @@ func (s *seeder) collectSeedRefs(fromGitDir string) (refs map[string]string, wan
 		refs[name] = oid
 		wants = append(wants, oid)
 	}
-	if len(refs) == 0 {
-		return nil, nil, "", fmt.Errorf("source repository has no refs to seed")
-	}
-	head, _ = s.g.Out(gitx.Opts{GitDir: fromGitDir}, "symbolic-ref", "HEAD")
-	return refs, wants, head, nil
+	return refs, wants
 }
 
 // packSeedObjects packs the full history (all wants, no haves) into a fresh
@@ -148,19 +162,30 @@ func (s *seeder) packSeedObjects(fromGitDir, work string, wants []string) (*agec
 	return pw, nil
 }
 
-// buildSeedManifest mints a generation-1 manifest for the packed history and
-// returns it alongside its encrypted ciphertext.
-func (s *seeder) buildSeedManifest(head string, refs map[string]string, pw *agecrypt.PackWriter) (*manifest.Manifest, []byte, error) {
+// seedManifest assembles the genesis (generation-1) manifest for a freshly
+// seeded remote: the given repo id, head, and refs, carrying a SINGLE pack with
+// no prior packs to supersede. It is the from-scratch counterpart to the
+// engine's nextPushManifest (continuation push) and repackManifest (full
+// repack) builders; the random repo-id minting and the Encode/EncryptBytes that
+// surround it stay in buildSeedManifest so this construction stays pure.
+func seedManifest(repoID, head string, refs map[string]string, packID string, packSize int64) *manifest.Manifest {
 	m := manifest.New()
-	repoID, err := manifest.NewRepoID()
-	if err != nil {
-		return nil, nil, err
-	}
 	m.RepoID = repoID
 	m.Generation = 1
 	m.Head = head
 	m.Refs = refs
-	m.Packs = []manifest.Pack{{ID: pw.ID(), Size: pw.Size()}}
+	m.Packs = []manifest.Pack{{ID: packID, Size: packSize}}
+	return m
+}
+
+// buildSeedManifest mints a generation-1 manifest for the packed history and
+// returns it alongside its encrypted ciphertext.
+func (s *seeder) buildSeedManifest(head string, refs map[string]string, pw *agecrypt.PackWriter) (*manifest.Manifest, []byte, error) {
+	repoID, err := manifest.NewRepoID()
+	if err != nil {
+		return nil, nil, err
+	}
+	m := seedManifest(repoID, head, refs, pw.ID(), pw.Size())
 	plain, err := manifest.Encode(m)
 	if err != nil {
 		return nil, nil, err

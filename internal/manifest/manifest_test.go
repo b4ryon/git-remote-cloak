@@ -47,6 +47,9 @@ func TestValidationRejections(t *testing.T) {
 		"malformed repo id":  func(m *Manifest) { m.RepoID = "xyz" },
 		"non-branch head":    func(m *Manifest) { m.Head = "refs/tags/v1" },
 		"bad ref name":       func(m *Manifest) { m.Refs["main"] = oidA },
+		"newline ref name":   func(m *Manifest) { m.Refs["refs/heads/a\nrefs/heads/b"] = oidA },
+		"space ref name":     func(m *Manifest) { m.Refs["refs/heads/a b"] = oidA },
+		"control char head":  func(m *Manifest) { m.Head = "refs/heads/a\tb"; m.Refs["refs/heads/a\tb"] = oidA },
 		"bad oid":            func(m *Manifest) { m.Refs["refs/heads/x"] = "zzz" },
 		"bad pack id":        func(m *Manifest) { m.Packs[0].ID = "short" },
 		"negative size":      func(m *Manifest) { m.Packs[0].Size = -1 },
@@ -86,6 +89,41 @@ func TestDecodeGarbage(t *testing.T) {
 	}
 	if _, err := Decode([]byte(`{"version":7}`)); err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("Decode accepted unsupported version: %v", err)
+	}
+}
+
+// TestDecodeRejectsTrailingData pins the explicit, named cases of the
+// trailing-data guard that FuzzDecodeTrailingData (which caps its fuzzed
+// trailing to a few bytes to keep encoding/json's tokenizer coverage bounded)
+// cannot carry directly: a full second manifest object and a partial object
+// appended after a valid manifest, plus the tolerated trailing-whitespace edges.
+// json.Decoder.Decode reads only the first JSON value and would otherwise leave
+// such trailing bytes silently unread.
+func TestDecodeRejectsTrailingData(t *testing.T) {
+	base, err := Encode(valid())
+	if err != nil {
+		t.Fatalf("base manifest does not encode: %v", err)
+	}
+	// Trailing JSON whitespace is tolerated (json.Unmarshal does too) and must
+	// not perturb the parse.
+	for _, ws := range []string{"", " ", "\n", "\t \r\n"} {
+		if _, err := Decode(append(append([]byte(nil), base...), ws...)); err != nil {
+			t.Errorf("Decode rejected manifest with whitespace-only trailing %q: %v", ws, err)
+		}
+	}
+	// Any non-whitespace trailing -- a second full manifest, a partial object,
+	// or arbitrary bytes -- must be rejected, not silently dropped.
+	for name, trailing := range map[string]string{
+		"second full manifest": string(base),
+		"partial object":       `{"version":1}`,
+		"empty object":         "{}",
+		"bare number":          "0",
+		"garbage":              "garbage",
+		"NUL byte":             "\x00",
+	} {
+		if _, err := Decode(append(append([]byte(nil), base...), trailing...)); err == nil {
+			t.Errorf("%s: Decode accepted a manifest with trailing data", name)
+		}
 	}
 }
 
