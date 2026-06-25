@@ -27,13 +27,13 @@ trusted machines that hold the key:
 ## Not a good fit
 
 - Source you want host-side features on (CI, pull requests, blame, code
-  search) — the host sees only ciphertext; use a normal private repo.
-- Large or binary-heavy repos — they work, but inefficiently (whole-pack
+  search), the host sees only ciphertext; use a normal private repo.
+- Large or binary-heavy repos, they work, but inefficiently (whole-pack
   ciphertext, no host-side dedup or partial fetch, no git-LFS).
-- Many users needing differentiated access — one shared key, no per-user ACLs.
-- Hiding traffic rather than content — repo existence, owner, push timing, and
+- Many users needing differentiated access, one shared key, no per-user ACLs.
+- Hiding traffic rather than content, repo existence, owner, push timing, and
   pack sizes/counts still leak.
-- Cases where you already trust the host — a plain private repo is simpler.
+- Cases where you already trust the host, a plain private repo is simpler.
 
 ## Replacement for git-remote-gcrypt
 
@@ -141,7 +141,7 @@ git add -A && git commit -m "initial vault" && git push -u origin main
 
 For automatic commit-and-sync, use the [Obsidian Git](https://github.com/Vinzent03/obsidian-git)
 community plugin: on desktop it shells out to your system git, so cloak runs
-transparently. Ensure `git-remote-cloak` is on the PATH Obsidian sees — macOS
+transparently. Ensure `git-remote-cloak` is on the PATH Obsidian sees, macOS
 GUI apps get a minimal PATH, so install it under e.g. `/usr/local/bin`
 (`make install PREFIX=/usr/local/bin`), not just `~/bin`. Mobile Obsidian is
 unsupported: its Git plugin uses a pure-JavaScript git (isomorphic-git) that
@@ -157,26 +157,26 @@ build with a stable self-signed code-signing certificate
 
 ### Operator commands (`git cloak`)
 
-- `status` — remote generation, repo id, packs, applied state.
-- `repack` / `rekey` — full consolidation / re-encrypt under a new key.
-- `accept-rollback` / `accept-repo-change` — one-shot overrides for a detected
+- `status`, remote generation, repo id, packs, applied state.
+- `repack` / `rekey`, full consolidation / re-encrypt under a new key.
+- `accept-rollback` / `accept-repo-change`, one-shot overrides for a detected
   generation regression or repository-identity change (user-presence gated).
-- `key export [--force-insecure]` / `key import` / `key delete` — key transfer,
+- `key export [--force-insecure]` / `key import` / `key delete`, key transfer,
   backup, and removal (delete requires a typed YES confirmation).
 
 ### Configuration
 
 git config (`cloak.*`):
 
-- `keyRef` — where the master key lives. The default differs by OS:
+- `keyRef`, where the master key lives. The default differs by OS:
   `keychain:default` (macOS Keychain) and `file:~/.config/cloak/keys/default`
   (Linux/other). Each machine uses its own platform default, so a Mac+Linux pair
   works without touching this. Set `cloak.keyRef` explicitly only if you store
   the key elsewhere, and use the right form for that machine's platform
   (`keychain:<name>` or `file:<path>`).
-- `geometricFactor` — pack-consolidation aggressiveness (default 2; `0` disables).
-- `pushRetries` — compare-and-swap retry budget under concurrent pushes (default 5).
-- `branch` — the backend branch name on the host (default `cloak`).
+- `geometricFactor`, pack-consolidation aggressiveness (default 2; `0` disables).
+- `pushRetries`, compare-and-swap retry budget under concurrent pushes (default 5).
+- `branch`, the backend branch name on the host (default `cloak`).
 
 Environment: `CLOAK_GIT_TIMEOUT` (git subprocess timeout, default 120s; `0`/`off`
 disables), `CLOAK_LOG` (per-repo debug log level).
@@ -199,7 +199,7 @@ a few properties are accepted trade-offs rather than protected:
 - **Key export can be scripted.** `git cloak key export` is gated by a
   user-presence (Touch ID) prompt, but `--force-insecure` deliberately skips it
   for non-interactive backups. Any process running as you with that flag can read
-  the raw key, by design — treat the key like any other top-level secret.
+  the raw key, by design, treat the key like any other top-level secret.
 
 ## Build and test
 
@@ -219,13 +219,13 @@ make check              # vet + vuln + test + test-integration + test-darwin
 cloak builds on:
 
 - [age](https://age-encryption.org) (`filippo.io/age`) by Filippo Valsorda and
-  contributors — the encryption format and the stanza/STREAM primitives.
+  contributors, the encryption format and the stanza/STREAM primitives.
 - [`golang.org/x/crypto`](https://pkg.go.dev/golang.org/x/crypto),
   [`golang.org/x/term`](https://pkg.go.dev/golang.org/x/term), and
-  [`golang.org/x/text`](https://pkg.go.dev/golang.org/x/text) by the Go Authors —
+  [`golang.org/x/text`](https://pkg.go.dev/golang.org/x/text) by the Go Authors,
   ChaCha20-Poly1305 and HKDF for the cloak/v1 stanza, terminal detection for the
   user-presence gate, and Unicode handling in the tests.
-- [git](https://git-scm.com) — cloak is a remote helper; git does all local
+- [git](https://git-scm.com), cloak is a remote helper; git does all local
   object storage and transport.
 
 Inspired by: [git-remote-gcrypt](https://github.com/spwhitton/git-remote-gcrypt),
