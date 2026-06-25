@@ -19,11 +19,11 @@ import (
 // pack size. Pack sizes are non-negative (manifest.Validate) and capped, so
 // uint64 math is exact here.
 func smaller(size int64, factor int, cum uint64) bool {
-	hi, lo := bits.Mul64(uint64(factor), cum)
+	hi, lo := bits.Mul64(uint64(factor), cum) // #nosec G115 -- factor is > 0 here (Victims guards factor <= 0); uint64 math is exact, see package doc
 	if hi != 0 {
 		return true
 	}
-	return uint64(size) < lo
+	return uint64(size) < lo // #nosec G115 -- pack sizes are non-negative (manifest.Validate); uint64 conversion is exact
 }
 
 // Victims returns the packs that must merge to restore the invariant, or
@@ -54,7 +54,7 @@ func initialSplit(sorted []manifest.Pack, factor int) int {
 		if i > 0 && smaller(p.Size, factor, cum) {
 			split = i
 		}
-		cum += uint64(p.Size)
+		cum += uint64(p.Size) // #nosec G115 -- pack sizes are non-negative (manifest.Validate); uint64 conversion is exact
 	}
 	return split
 }
@@ -64,13 +64,13 @@ func initialSplit(sorted []manifest.Pack, factor int) int {
 func extendSplit(sorted []manifest.Pack, factor, split int) int {
 	var combined uint64
 	for i := 0; i <= split; i++ {
-		combined += uint64(sorted[i].Size)
+		combined += uint64(sorted[i].Size) // #nosec G115 -- pack sizes are non-negative (manifest.Validate); uint64 conversion is exact
 	}
 	for j := split + 1; j < len(sorted); j++ {
 		if !smaller(sorted[j].Size, factor, combined) {
 			break
 		}
-		combined += uint64(sorted[j].Size)
+		combined += uint64(sorted[j].Size) // #nosec G115 -- pack sizes are non-negative (manifest.Validate); uint64 conversion is exact
 		split = j
 	}
 	return split

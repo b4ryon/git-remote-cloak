@@ -198,7 +198,7 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 		"-c", "protocol.ext.allow=never",
 		"-c", "protocol.fd.allow=never",
 	}, args...)
-	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...) // #nosec G204 -- git remote helper: command is the fixed "git" binary; variable args are inherent, and ext/fd transports are disabled above as defense in depth
 	cmd.Dir = o.Dir
 	cmd.Env = buildEnv(o)
 

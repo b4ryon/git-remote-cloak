@@ -75,7 +75,7 @@ func (d *Dir) Lock() (func() error, error) {
 		return nil, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return func() error {
@@ -102,7 +102,7 @@ func (d *Dir) LogPath() string { return filepath.Join(d.Root, "log") }
 // nil error) when the file does not exist yet -- the first-contact case every
 // caller treats as "no record".
 func (d *Dir) readStateFile(name string) ([]byte, bool, error) {
-	b, err := os.ReadFile(filepath.Join(d.Root, name))
+	b, err := os.ReadFile(filepath.Join(d.Root, name)) // #nosec G304 -- per-remote state dir Root + a fixed internal filename; name is never caller- or remote-controlled
 	if os.IsNotExist(err) {
 		return nil, false, nil
 	}
@@ -277,7 +277,7 @@ func (d *Dir) MarkApplied(ids ...string) error {
 	if err != nil {
 		return fmt.Errorf("append to state file %q: %w", appliedFile, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	for _, id := range ids {
 		if _, err := fmt.Fprintln(f, id); err != nil {
 			return fmt.Errorf("append to state file %q: %w", appliedFile, err)

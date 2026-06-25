@@ -624,11 +624,11 @@ func retainLivePackBlobs(packOIDs map[string]string, live map[string]bool) {
 // hashPackBlob opens the new pack ciphertext at path and returns the blob oid
 // the backend would store it under, so treePackBlobs can add it to the tree map.
 func (e *Engine) hashPackBlob(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- path is a TmpDir() content-addressed scratch ciphertext; no untrusted path component
 	if err != nil {
 		return "", fmt.Errorf("open pack ciphertext scratch file %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return e.Be.HashObject(f)
 }
 
@@ -638,9 +638,9 @@ func holdHook(attempt int) {
 	if dir == "" || attempt != 0 {
 		return
 	}
-	_ = os.WriteFile(filepath.Join(dir, "waiting"), []byte("1"), 0o600)
+	_ = os.WriteFile(filepath.Join(dir, "waiting"), []byte("1"), 0o600) // #nosec G703 -- test-only hold hook; dir comes from a test-set env var (holdHookEnv), unreachable in normal operation
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "release")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "release")); err == nil { // #nosec G703 -- test-only hold hook; dir comes from a test-set env var (holdHookEnv), unreachable in normal operation
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

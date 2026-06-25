@@ -1,0 +1,51 @@
+# golangci-lint configuration for git-remote-cloak.
+#
+# Aggregates the stricter static-analysis tools the project gates on:
+# errcheck, govet, ineffassign, staticcheck, unused (the standard set) plus
+# gosec. Run with `make lint`. CI runs this on GOOS=linux, where the pure-Go
+# file keystore is compiled (the cgo Keychain backend is build-constrained out),
+# matching the gosec-clean target the project established.
+#
+# Every exclusion below is a documented, justified false positive or a
+# universally-accepted convention -- production correctness findings are fixed
+# in code, not suppressed here.
+version: "2"
+
+run:
+  # Lint test code too: tests carry real correctness logic worth gating on.
+  tests: true
+
+linters:
+  # `default: standard` = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - gosec
+
+  settings:
+    errcheck:
+      # Writes to the terminal (os.Stdout/os.Stderr via fmt.Fprint*) carry no
+      # actionable error: there is nothing to recover to and no alternate sink.
+      # This is the standard errcheck convention for CLI output; the durable
+      # write paths (state, keystore, pack files) already check their errors.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+  exclusions:
+    rules:
+      # gosec is a production-security scanner. Test code intentionally launches
+      # subprocesses with computed arguments (git fixtures), opens files by
+      # variable path (scratch dirs), performs fuzz-harness integer conversions,
+      # and writes permissive fixtures -- none of which are real risks in a test
+      # binary. Production gosec findings stay covered by inline `#nosec`.
+      - path: _test.go
+        linters:
+          - gosec
+      # QF1001 (apply De Morgan's law) is a stylistic quickfix. The explicit
+      # positive hex-digit range checks in the fuzz validators read more clearly
+      # than the negated/distributed form, so keep them as written in tests.
+      - path: _test.go
+        linters:
+          - staticcheck
+        text: "QF1001"

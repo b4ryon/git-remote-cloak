@@ -58,7 +58,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	in := bufio.NewScanner(stdin)
 	in.Buffer(make([]byte, 0, 64*1024), 1<<20)
 	out := bufio.NewWriter(stdout)
-	defer out.Flush()
+	defer func() { _ = out.Flush() }()
 
 	for in.Scan() {
 		done, err := s.dispatchLine(in, out, in.Text())
@@ -86,7 +86,7 @@ func (s *session) dispatchLine(in *bufio.Scanner, out *bufio.Writer, line string
 
 	case strings.HasPrefix(line, "option "):
 		fmt.Fprintln(out, s.option(strings.TrimPrefix(line, "option ")))
-		out.Flush()
+		_ = out.Flush()
 
 	case line == "list" || line == "list for-push":
 		return false, s.handleList(out, line == "list for-push")
@@ -113,7 +113,7 @@ func (s *session) emitCapabilities(out *bufio.Writer) {
 		fmt.Fprintln(out, c)
 	}
 	fmt.Fprintln(out)
-	out.Flush()
+	_ = out.Flush()
 }
 
 // collectBatch reads a contiguous batch of same-prefix protocol lines. first
@@ -170,7 +170,7 @@ func (s *session) option(rest string) string {
 	name, value, _ := strings.Cut(rest, " ")
 	switch name {
 	case "verbosity":
-		fmt.Sscanf(value, "%d", &s.verbosity)
+		_, _ = fmt.Sscanf(value, "%d", &s.verbosity)
 		return "ok"
 	case "progress":
 		return "ok"
@@ -214,7 +214,7 @@ func (s *session) handleList(out *bufio.Writer, forPush bool) error {
 		fmt.Fprintln(out, l)
 	}
 	fmt.Fprintln(out)
-	out.Flush()
+	_ = out.Flush()
 	return nil
 }
 
@@ -261,7 +261,7 @@ func (s *session) handleFetch(in *bufio.Scanner, out *bufio.Writer, line string)
 		fmt.Fprintln(out, l)
 	}
 	fmt.Fprintln(out)
-	out.Flush()
+	_ = out.Flush()
 	return nil
 }
 
@@ -322,7 +322,7 @@ func (s *session) handlePush(in *bufio.Scanner, out *bufio.Writer, line string) 
 		fmt.Fprintln(out, l)
 	}
 	fmt.Fprintln(out)
-	out.Flush()
+	_ = out.Flush()
 	return nil
 }
 

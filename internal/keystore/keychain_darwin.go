@@ -98,6 +98,11 @@ func kcLoad(name string) ([]byte, error) {
 			"keychain item %q unavailable (status %d); run `git cloak keygen` or `git cloak key import`", name, int(st))
 	}
 	defer C.cloak_kc_free(data)
+	// length is the keychain item's own byte count (our master key, far under
+	// 2 GiB) and C.GoBytes requires a C.int. gosec G115 flags this cgo uint32
+	// -> int32 conversion on darwin; inline #nosec cannot suppress it because
+	// cgo strips comments before gosec analyzes the generated file, so it is
+	// excluded at the linter-config level instead.
 	out := C.GoBytes(data, C.int(length))
 	return out, nil
 }

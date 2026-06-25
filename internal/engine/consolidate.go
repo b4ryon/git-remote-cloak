@@ -27,7 +27,7 @@ func (e *Engine) consolidate(cur *RemoteState, plan *pushPlan, victims []manifes
 	if err != nil {
 		return fmt.Errorf("create consolidation scratch dir: %w", err)
 	}
-	defer os.RemoveAll(scratch)
+	defer func() { _ = os.RemoveAll(scratch) }()
 	scratchGit := filepath.Join(scratch, "odb.git")
 	if _, _, err := e.G.Run(gitx.Opts{Scrub: true}, "init", "--bare", "--quiet", scratchGit); err != nil {
 		return cloakerr.New(cloakerr.LocalGit, "init scratch repo", err)
@@ -164,16 +164,16 @@ func (e *Engine) indexPackInto(gitDir, head string, p manifest.Pack, localPath s
 	ctPath := localPath
 	if ctPath == "" {
 		ctPath = filepath.Join(e.St.TmpDir(), "cons-"+short+".age")
-		defer os.Remove(ctPath)
+		defer func() { _ = os.Remove(ctPath) }()
 		if err := e.downloadVerifyPack(head, ctPath, p); err != nil {
 			return err
 		}
 	}
-	ct, err := os.Open(ctPath)
+	ct, err := os.Open(ctPath) // #nosec G304 -- ctPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return fmt.Errorf("open pack ciphertext scratch file %q: %w", ctPath, err)
 	}
-	defer ct.Close()
+	defer func() { _ = ct.Close() }()
 	plain, err := agecrypt.Decrypt(ct, e.Key)
 	if err != nil {
 		return cloakerr.WithHintOn(err, packTamperHint)

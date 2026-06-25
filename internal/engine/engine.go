@@ -294,13 +294,13 @@ const packTamperHint = "the manifest decrypted under this key but this pack did 
 // does not match the manifest pack id (the host served corrupted or tampered
 // data, since the key is already proven correct by the manifest decrypt).
 func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error {
-	f, err := os.OpenFile(ctPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	f, err := os.OpenFile(ctPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304 -- ctPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return fmt.Errorf("create pack ciphertext scratch file %q: %w", ctPath, err)
 	}
 	hasher := sha256.New()
 	if err := e.Be.ReadBlob(head, "packs/"+p.ID+".age", io.MultiWriter(f, hasher)); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
@@ -319,8 +319,8 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 	short := p.ID[:12]
 	ctPath := filepath.Join(e.St.TmpDir(), "pack-"+short+".age")
 	ptPath := filepath.Join(e.St.TmpDir(), "pack-"+short+".pack")
-	defer os.Remove(ctPath)
-	defer os.Remove(ptPath)
+	defer func() { _ = os.Remove(ctPath) }()
+	defer func() { _ = os.Remove(ptPath) }()
 
 	if err := e.downloadVerifyPack(head, ctPath, p); err != nil {
 		return "", err
@@ -334,21 +334,21 @@ func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err e
 // decryptPackTo decrypts the age ciphertext at ctPath and writes the
 // plaintext pack to ptPath, classifying AEAD failures as Tamper.
 func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
-	ct, err := os.Open(ctPath)
+	ct, err := os.Open(ctPath) // #nosec G304 -- ctPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return fmt.Errorf("open pack ciphertext scratch file %q: %w", ctPath, err)
 	}
-	defer ct.Close()
+	defer func() { _ = ct.Close() }()
 	plain, err := agecrypt.Decrypt(ct, e.Key)
 	if err != nil {
 		return cloakerr.WithHintOn(err, packTamperHint)
 	}
-	ptFile, err := os.OpenFile(ptPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	ptFile, err := os.OpenFile(ptPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) // #nosec G304 -- ptPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return fmt.Errorf("create pack plaintext scratch file %q: %w", ptPath, err)
 	}
 	if _, err := io.Copy(ptFile, plain); err != nil {
-		ptFile.Close()
+		_ = ptFile.Close()
 		return cloakerr.WithHintOn(err, packTamperHint) // Tamper-classified by agecrypt on AEAD failure
 	}
 	if err := ptFile.Close(); err != nil {
@@ -360,11 +360,11 @@ func (e *Engine) decryptPackTo(ctPath, ptPath string) error {
 // indexPackFile feeds the plaintext pack at ptPath to git index-pack in the
 // local repo and returns the .keep file it created (empty if none).
 func (e *Engine) indexPackFile(ptPath, short string, size int64) (keepFile string, err error) {
-	pt, err := os.Open(ptPath)
+	pt, err := os.Open(ptPath) // #nosec G304 -- ptPath is TmpDir()+content-addressed name (pack id is 64-hex, manifest.Validate); no untrusted path component
 	if err != nil {
 		return "", fmt.Errorf("open pack plaintext scratch file %q: %w", ptPath, err)
 	}
-	defer pt.Close()
+	defer func() { _ = pt.Close() }()
 	out, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir, Stdin: pt},
 		"index-pack", "--stdin", "--keep=cloak")
 	if err != nil {

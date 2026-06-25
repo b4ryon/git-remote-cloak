@@ -45,13 +45,13 @@ func TestWithHintOn(t *testing.T) {
 	// caches its rendered string, so verify via extraction, not the outer
 	// .Error().)
 	wrapped := fmt.Errorf("outer: %w", New(Tamper, "decrypt", errors.New("boom")))
-	WithHintOn(wrapped, "inner hint")
+	_ = WithHintOn(wrapped, "inner hint")
 	var ce *Error
 	if !errors.As(wrapped, &ce) || ce.Hint != "inner hint" {
 		t.Fatalf("WithHintOn did not set the wrapped *Error hint: %+v", ce)
 	}
 	// Idempotent: a second call must not overwrite an existing hint.
-	WithHintOn(direct, "second hint")
+	_ = WithHintOn(direct, "second hint")
 	if strings.Contains(direct.Error(), "second hint") {
 		t.Fatal("WithHintOn overwrote an existing hint")
 	}

@@ -82,7 +82,7 @@ func (s *seeder) run(from string, stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("create seed scratch dir under %q: %w", fromGitDir, err)
 	}
-	defer os.RemoveAll(work)
+	defer func() { _ = os.RemoveAll(work) }()
 
 	pw, err := s.packSeedObjects(fromGitDir, work, wants)
 	if err != nil {
@@ -232,7 +232,7 @@ func (s *seeder) pushSeedCommit(work string, m *manifest.Manifest, manifestCT []
 // real failure is the HashObject error). Both leaf-IO failures carry operation
 // context, matching the engine's scratch-IO wrapping.
 func hashPackFile(be *backend.Backend, path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- local scratch pack path built by the seed command (admin/dev tool), not remote-controlled
 	if err != nil {
 		return "", fmt.Errorf("open pack scratch file %q: %w", path, err)
 	}

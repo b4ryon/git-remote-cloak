@@ -134,7 +134,7 @@ func pinGeneration(t *testing.T, c *harness.Client) int {
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() && filepath.Base(path) == "generation" {
 			if b, rerr := os.ReadFile(path); rerr == nil {
-				fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &gen)
+				_, _ = fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &gen)
 			}
 		}
 		return nil

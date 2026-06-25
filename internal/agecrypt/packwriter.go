@@ -46,8 +46,8 @@ func NewPackWriter(dir string, master keystore.Key) (*PackWriter, error) {
 	pw := &PackWriter{f: f, hasher: sha256.New()}
 	w, err := Encrypt(counting{pw}, master)
 	if err != nil {
-		f.Close()
-		os.Remove(f.Name())
+		_ = f.Close()
+		_ = os.Remove(f.Name())
 		return nil, err
 	}
 	pw.w = w
@@ -64,7 +64,7 @@ func (p *PackWriter) Close() error {
 	}
 	p.closed = true
 	if err := p.w.Close(); err != nil {
-		p.f.Close()
+		_ = p.f.Close()
 		return err
 	}
 	if err := p.f.Close(); err != nil {

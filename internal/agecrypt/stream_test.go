@@ -205,7 +205,7 @@ func TestLargeStreamConstantMemory(t *testing.T) {
 			pw.CloseWithError(err)
 			return
 		}
-		pw.Close()
+		_ = pw.Close()
 	}()
 
 	dr, err := Decrypt(pr, k)

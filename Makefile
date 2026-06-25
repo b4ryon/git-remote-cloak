@@ -16,7 +16,7 @@ VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo unknown)
 LDFLAGS := -X github.com/b4ryon/git-remote-cloak/internal/version.Version=$(VERSION)
 DIST := dist
 
-.PHONY: build release install check-go test test-integration test-race test-darwin test-e2e vet vuln check fmt sign clean
+.PHONY: build release install check-go test test-integration test-race test-darwin test-e2e vet vuln lint check fmt sign clean
 
 # Code-signing identity for stable Keychain item ACLs. Default is ad-hoc
 # (identity changes per build, so the ACL re-prompts). Set CLOAK_SIGN_ID to a
@@ -92,8 +92,16 @@ vet:
 vuln:
 	govulncheck ./...
 
-# Aggregate gate: formatting, vet, vulnerabilities, and every test suite.
-check: vet vuln test test-integration test-darwin
+# Stricter static analysis via golangci-lint (errcheck, govet, ineffassign,
+# staticcheck, unused, gosec) per .golangci.yml. Install once with (Go 1.26
+# needs the v2 module path):
+#   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+# CI runs this on GOOS=linux (pure-Go file keystore), where gosec is clean.
+lint:
+	golangci-lint run ./...
+
+# Aggregate gate: vet, lint, vulnerabilities, and every test suite.
+check: vet lint vuln test test-integration test-darwin
 
 fmt:
 	gofmt -l -w cmd internal test

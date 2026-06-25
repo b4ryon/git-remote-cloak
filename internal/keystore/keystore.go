@@ -272,7 +272,7 @@ func loadFile(path string) (Key, error) {
 		return Key{}, cloakerr.Newf(cloakerr.KeyUnavailable, "load key file",
 			"%s has mode %04o; refusing group/world-accessible key files (want 0600)", path, perm)
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 -- path is the operator's own configured key file (file:...); reading the configured key is the intended operation
 	if err != nil {
 		return Key{}, cloakerr.New(cloakerr.KeyUnavailable, "load key file", err)
 	}
@@ -283,7 +283,7 @@ func saveFile(path string, k Key) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- path is the operator's own configured key file (file:...); writing the configured key is the intended operation
 	if err != nil {
 		if os.IsExist(err) {
 			return cloakerr.New(cloakerr.KeyUnavailable, "save key file",
@@ -297,11 +297,11 @@ func saveFile(path string, k Key) error {
 	// failure paths the best-effort Close is cleanup only -- its error is
 	// subordinate to the failure already being returned.
 	if _, err := f.WriteString(k.Export() + "\n"); err != nil {
-		f.Close()
+		_ = f.Close()
 		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return cloakerr.New(cloakerr.KeyUnavailable, "save key file", err)
 	}
 	if err := f.Close(); err != nil {

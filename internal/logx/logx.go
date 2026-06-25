@@ -83,7 +83,7 @@ func Setup(o Options) (*slog.Logger, func()) {
 			// the prior mode but must not disable logging.
 			_ = f.Chmod(0o600)
 			handlers = append(handlers, slog.NewJSONHandler(f, &slog.HandlerOptions{Level: o.FileLevel}))
-			closer = func() { f.Close() }
+			closer = func() { _ = f.Close() }
 		}
 	}
 	sid := make([]byte, 4)
