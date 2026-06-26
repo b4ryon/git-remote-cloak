@@ -255,6 +255,77 @@ func TestEngineGeometricConsolidation(t *testing.T) {
 	}
 }
 
+// TestRejectedBackendPushLeavesPinUnadvanced locks in the crash-safety
+// invariant that guards the dangerous direction of an interrupted push: the
+// durable rollback pin is advanced only after the backend accepts (the PushOK
+// arm), never before. If a failed push could move the pin ahead of the
+// backend-accepted generation, the next fetch would see a lower remote
+// generation and raise a false ROLLBACK ALARM. Iter6's self-heal test covers
+// only the benign direction (pin left *behind* the backend); this covers the
+// other half. A reaches the backend but loses the compare-and-swap to B's
+// concurrent push (retries disabled so the loss is terminal); the push must
+// fail and leave A's on-disk pin byte-for-byte where its last accepted push
+// left it.
+func TestRejectedBackendPushLeavesPinUnadvanced(t *testing.T) {
+	g := gitx.New(discard())
+	host := newHostRepo(t, g)
+	key, _ := keystore.Generate()
+
+	a := newMachine(t, g, host, key)
+	a.e.Cfg.PushRetries = 0 // one attempt: a lost CAS is terminal, not retried
+	oid1 := a.commit(t, "f1.txt", "base")
+	_, rsA := a.push(t, a.load(t), RefUpdate{Src: mainRef, Dst: mainRef})
+	if rsA.Manifest.Generation != 1 {
+		t.Fatalf("first push generation = %d, want 1", rsA.Manifest.Generation)
+	}
+	pinBefore, ok, err := a.e.St.LoadPin()
+	if err != nil || !ok {
+		t.Fatalf("pin after first push: ok=%v err=%v", ok, err)
+	}
+
+	// B fetches, builds a child commit via plumbing, and pushes it: the backend
+	// advances to generation 2 while A still holds its stale generation-1 view.
+	b := newMachine(t, g, host, key)
+	rsB := b.load(t)
+	if _, err := b.e.FetchApply(rsB); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := g.Out(gitx.Opts{GitDir: b.gitDir}, "rev-parse", oid1+"^{tree}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oid2, err := g.Out(gitx.Opts{GitDir: b.gitDir}, "commit-tree", tree, "-p", oid1, "-m", "from b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results, _ := b.push(t, rsB, RefUpdate{Src: oid2, Dst: mainRef}); results[0].Err != "" {
+		t.Fatalf("b push rejected: %s", results[0].Err)
+	}
+
+	// A pushes its own child of oid1 against its stale view: planning accepts it
+	// (fast-forward from A's seen head) so the attempt reaches the backend, but
+	// the branch has moved to B's commit, so the plain FF push loses the CAS and,
+	// with retries disabled, the push terminates as CASExhausted.
+	a.commit(t, "f3.txt", "from a")
+	_, _, perr := a.e.Push(rsA, []RefUpdate{{Src: mainRef, Dst: mainRef}}, false)
+	if perr == nil {
+		t.Fatal("stale push unexpectedly succeeded")
+	}
+	if kind, ok := cloakerr.KindOf(perr); !ok || kind != cloakerr.CASExhausted {
+		t.Fatalf("stale push error kind = %v, want CASExhausted (err: %v)", kind, perr)
+	}
+
+	// The rejected push must not have advanced the durable rollback pin: it is
+	// still exactly the generation/hash the backend last accepted.
+	pinAfter, ok, err := a.e.St.LoadPin()
+	if err != nil || !ok {
+		t.Fatalf("pin after rejected push: ok=%v err=%v", ok, err)
+	}
+	if pinAfter != pinBefore {
+		t.Fatalf("rejected push advanced the pin: before %+v, after %+v", pinBefore, pinAfter)
+	}
+}
+
 func TestFullRepackConvergesAfterConcurrentPush(t *testing.T) {
 	g := gitx.New(discard())
 	host := newHostRepo(t, g)

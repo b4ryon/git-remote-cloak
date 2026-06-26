@@ -112,27 +112,78 @@ func (d *Dir) readStateFile(name string) ([]byte, bool, error) {
 	return b, true, nil
 }
 
-// writeStateFile atomically replaces the state file destName: it writes the
-// content to tmpName under TmpDir (same filesystem) and renames it into place.
+// writeStateFile atomically and durably replaces the state file destName: it
+// writes the content to tmpName under TmpDir (same filesystem), fsyncs it,
+// renames it into place, then fsyncs the directory. The temp-file-then-rename
+// makes the replacement atomic (a reader never sees a torn file); the two
+// fsyncs make it crash-safe, so an interrupted push cannot leave the pin or
+// repo-id file existing-but-zero-length or reverted to stale content after a
+// power loss or kernel crash.
 func (d *Dir) writeStateFile(tmpName, destName string, content []byte) error {
 	tmp := filepath.Join(d.TmpDir(), tmpName)
-	if err := os.WriteFile(tmp, content, 0o600); err != nil {
+	if err := writeFileSync(tmp, content, 0o600); err != nil {
 		return fmt.Errorf("write state file %q: %w", destName, err)
 	}
 	if err := os.Rename(tmp, filepath.Join(d.Root, destName)); err != nil {
 		return fmt.Errorf("write state file %q: %w", destName, err)
 	}
+	if err := syncDir(d.Root); err != nil {
+		return fmt.Errorf("write state file %q: %w", destName, err)
+	}
 	return nil
 }
 
-// removeStateFile deletes the named state file, treating an already-absent
-// file as success so callers can clear a record idempotently.
+// writeFileSync writes content to path (creating or truncating) and fsyncs the
+// file's data to disk before returning, so a crash after the caller renames it
+// into place cannot surface a zero-length or partially written file. Mirrors
+// the fsync-before-success discipline keystore.saveFile uses for the key file.
+func writeFileSync(path string, content []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) // #nosec G304 -- path is TmpDir() + a fixed internal temp name; never caller- or remote-controlled
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(content); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir fsyncs a directory so a rename into it is durable across a crash:
+// without it the renamed entry can be lost on power loss even though the
+// file's own data was fsynced.
+func syncDir(path string) error {
+	f, err := os.Open(path) // #nosec G304 -- path is the per-remote state dir Root; never caller- or remote-controlled
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// removeStateFile durably deletes the named state file: it removes the file
+// then fsyncs the parent directory so the deletion survives a crash, the
+// mirror of writeStateFile's post-rename dir fsync. Without it a power loss in
+// the instant after os.Remove could resurrect a just-cleared pin, re-raising a
+// rollback/repo-change alarm the operator had already accepted. An
+// already-absent file is success (and needs no sync: nothing changed on disk)
+// so callers can clear a record idempotently.
 func (d *Dir) removeStateFile(name string) error {
 	err := os.Remove(filepath.Join(d.Root, name))
 	if os.IsNotExist(err) {
 		return nil
 	}
 	if err != nil {
+		return fmt.Errorf("remove state file %q: %w", name, err)
+	}
+	if err := syncDir(d.Root); err != nil {
 		return fmt.Errorf("remove state file %q: %w", name, err)
 	}
 	return nil
@@ -268,23 +319,29 @@ func (d *Dir) AppliedSet() (map[string]bool, error) {
 	return out, nil
 }
 
-// MarkApplied appends pack ids to the applied set.
+// MarkApplied records pack ids as already indexed into the local repo. It
+// reads the current set and rewrites the file atomically and durably via
+// writeStateFile (temp file, fsync, rename, dir fsync), so an interrupted
+// write can never leave a torn line or a lost record: a reader sees either the
+// old set or the new one, never a half-written id. Callers hold the per-remote
+// flock (Dir.Lock), so the read-modify-write has no concurrent writer to race.
 func (d *Dir) MarkApplied(ids ...string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	f, err := os.OpenFile(filepath.Join(d.Root, appliedFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	out, _, err := d.readStateFile(appliedFile)
 	if err != nil {
-		return fmt.Errorf("append to state file %q: %w", appliedFile, err)
+		return err
 	}
-	defer func() { _ = f.Close() }()
+	// The sole writer (this function) always terminates every id with '\n', so
+	// a well-formed file ends in a newline; the guard only re-establishes the
+	// line boundary if an older non-atomic write left a torn final line.
+	if n := len(out); n > 0 && out[n-1] != '\n' {
+		out = append(out, '\n')
+	}
 	for _, id := range ids {
-		if _, err := fmt.Fprintln(f, id); err != nil {
-			return fmt.Errorf("append to state file %q: %w", appliedFile, err)
-		}
+		out = append(out, id...)
+		out = append(out, '\n')
 	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("append to state file %q: %w", appliedFile, err)
-	}
-	return nil
+	return d.writeStateFile("applied", appliedFile, out)
 }

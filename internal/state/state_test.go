@@ -3,6 +3,8 @@
 package state
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -103,6 +105,99 @@ func TestAppliedSet(t *testing.T) {
 	set, err = d.AppliedSet()
 	if err != nil || !set["p1"] || !set["p2"] || !set["p3"] || len(set) != 3 {
 		t.Fatalf("applied set after marks: %v %v", set, err)
+	}
+}
+
+// TestMarkAppliedRecoversTornFinalLine exercises MarkApplied's crash-recovery
+// guard against the on-disk residue of an interrupted write. Before MarkApplied
+// became an atomic temp-file-then-rename, it used O_APPEND, so a crash partway
+// through an append could leave the "applied" file ending without its trailing
+// newline (the id bytes landed but the '\n' did not). Such a legacy/torn file
+// may still exist on disk. MarkApplied must re-establish the line boundary
+// before appending so the new id is recorded as its own line rather than
+// concatenated onto the unterminated tail -- which would fabricate one mangled
+// id and lose two real ones, exactly the inconsistent state the atomicity work
+// is meant to preclude.
+func TestMarkAppliedRecoversTornFinalLine(t *testing.T) {
+	d := openDir(t)
+	// A legacy append that crashed after writing idB's bytes but before its
+	// newline: idA is cleanly terminated, idB is complete but unterminated.
+	idA, idB, idC := "aaaa", "bbbb", "cccc"
+	torn := idA + "\n" + idB // no trailing newline on idB
+	if err := os.WriteFile(filepath.Join(d.Root, appliedFile), []byte(torn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.MarkApplied(idC); err != nil {
+		t.Fatal(err)
+	}
+	set, err := d.AppliedSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{idA: true, idB: true, idC: true}
+	if len(set) != len(want) {
+		t.Fatalf("torn-line recovery: got %v, want %v", set, want)
+	}
+	for id := range want {
+		if !set[id] {
+			t.Fatalf("torn-line recovery dropped %q: got %v", id, set)
+		}
+	}
+	// The specific failure the guard prevents: the unterminated tail and the new
+	// id must never coalesce into one fabricated id.
+	if set[idB+idC] {
+		t.Fatalf("torn-line recovery concatenated %q onto the unterminated tail: got %v", idC, set)
+	}
+	// The rewrite must leave a well-formed, newline-terminated file so the next
+	// writer sees an intact line boundary and need not re-run the guard.
+	b, err := os.ReadFile(filepath.Join(d.Root, appliedFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(b); n == 0 || b[n-1] != '\n' {
+		t.Fatalf("recovered applied file is not newline-terminated: %q", b)
+	}
+}
+
+// TestWriteStateFileFailureLeavesPriorStateIntact verifies the core atomicity
+// guarantee of writeStateFile (and therefore of SavePin/SaveRepoID/MarkApplied,
+// which all route through it): an interrupted write that fails before its rename
+// can commit must leave the previously committed state file fully intact, never
+// truncated, emptied, or partially overwritten. This is precisely what makes the
+// temp-file-then-rename design crash-safe -- the live pin file is only ever
+// replaced by an atomic rename of an already-fully-written temp file, so a write
+// that dies partway through cannot corrupt the prior pin. The earlier ioerr
+// "write" subtest only asserts that such a failure is reported with context; it
+// never checks that the prior on-disk state survives, which is the property an
+// interrupted push actually depends on.
+//
+// The interruption is modeled by planting a directory at the fixed temp path
+// SavePin uses ("pin" under TmpDir), so writeFileSync's O_WRONLY open returns
+// EISDIR and the write aborts before touching the live pin file. This also pins
+// the design itself: were writeStateFile ever refactored to write the live file
+// in place, the planted temp directory would be irrelevant, the second SavePin
+// would succeed, and the "expected failure" assertion below would catch it.
+func TestWriteStateFileFailureLeavesPriorStateIntact(t *testing.T) {
+	d := openDir(t)
+	want := Pin{Generation: 9, ManifestHash: strings.Repeat("ab", 32)}
+	if err := d.SavePin(want); err != nil {
+		t.Fatal(err)
+	}
+	// After the first SavePin, its temp file has been renamed away, so the temp
+	// path is free to plant a directory at -- forcing the next write to fail at
+	// its open, before any rename into the state directory.
+	if err := os.Mkdir(filepath.Join(d.TmpDir(), "pin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SavePin(Pin{Generation: 10, ManifestHash: strings.Repeat("cd", 32)}); err == nil {
+		t.Fatal("expected the interrupted write to fail (temp path is a directory), got nil")
+	}
+	got, ok, err := d.LoadPin()
+	if err != nil || !ok {
+		t.Fatalf("prior pin became unreadable after a failed write: ok=%v err=%v", ok, err)
+	}
+	if got != want {
+		t.Fatalf("a failed write damaged the prior pin: got %+v, want %+v", got, want)
 	}
 }
 

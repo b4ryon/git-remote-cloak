@@ -430,8 +430,9 @@ func FuzzLoadPin(f *testing.F) {
 // exactly the trimmed, non-empty newline-delimited lines (no fabrication, no
 // dropped line, no empty id), and (2) round-trip, any clean ids MarkApplied
 // persists across one or more calls AppliedSet recovers as their de-duplicated
-// set. The "applied" file is created and only ever appended to by MarkApplied
-// (one "<id>\n" per id), so AppliedSet is its sole reader.
+// set. MarkApplied grows the "applied" file by reading the current set and
+// atomically rewriting it with each new "<id>\n" line appended, so the on-disk
+// shape AppliedSet parses is still one "<id>\n" per recorded id.
 func FuzzAppliedSet(f *testing.F) {
 	d, err := Open(f.TempDir(), "origin", "u")
 	if err != nil {
@@ -484,8 +485,8 @@ func FuzzAppliedSet(f *testing.F) {
 		}
 
 		// --- Round-trip path: clear the file and exercise MarkApplied's
-		// create+append from scratch, exactly as production grows the applied set
-		// over successive fetches. The ids are derived as hex so they are clean,
+		// create-then-grow from scratch, exactly as production grows the applied
+		// set over successive fetches. The ids are derived as hex so they are clean,
 		// non-empty, whitespace-free tokens that survive the "<id>\n" round-trip
 		// byte-identically. ---
 		if err := os.Remove(appliedPath); err != nil && !os.IsNotExist(err) {
