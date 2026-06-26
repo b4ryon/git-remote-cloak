@@ -126,6 +126,64 @@ func assertRefRejected(t *testing.T, ref string) {
 	failsClosed("Delete", Delete(ref))
 }
 
+// assertClassifyOracle re-derives the expected (kind, scheme, rest) from ref with
+// an independent first-colon split (idx, from IndexByte rather than the
+// implementation's strings.Cut) and fails if classifyRef disagrees.
+func assertClassifyOracle(t *testing.T, ref string, idx int, kind refKind, scheme, rest string) {
+	t.Helper()
+	var wantKind refKind
+	var wantScheme, wantRest string
+	if idx < 0 {
+		wantKind, wantScheme, wantRest = refMalformed, ref, ""
+	} else {
+		wantScheme, wantRest = ref[:idx], ref[idx+1:]
+		switch wantScheme {
+		case "file":
+			wantKind = refFile
+		case "keychain":
+			wantKind = refKeychain
+		default:
+			wantKind = refUnknown
+		}
+	}
+	if kind != wantKind || scheme != wantScheme || rest != wantRest {
+		t.Fatalf("classifyRef(%q) = (%d,%q,%q), want (%d,%q,%q)",
+			ref, kind, scheme, rest, wantKind, wantScheme, wantRest)
+	}
+}
+
+// assertClassifyFailClosed checks classifyRef's fail-closed contract: the kind is
+// always one of the four known values, and a file/keychain backend is selected
+// ONLY when the scheme before the first colon (at idx) is exactly that word.
+func assertClassifyFailClosed(t *testing.T, ref string, idx int, kind refKind) {
+	t.Helper()
+	switch kind {
+	case refMalformed, refFile, refKeychain, refUnknown:
+	default:
+		t.Fatalf("classifyRef(%q) returned out-of-range kind %d", ref, kind)
+	}
+	if (kind == refFile) != (idx >= 0 && ref[:idx] == "file") {
+		t.Fatalf("refFile classification disagrees with an exact \"file\" scheme for %q", ref)
+	}
+	if (kind == refKeychain) != (idx >= 0 && ref[:idx] == "keychain") {
+		t.Fatalf("refKeychain classification disagrees with an exact \"keychain\" scheme for %q", ref)
+	}
+}
+
+// assertClassifyReconstruct checks the classified pieces rebuild ref exactly, so
+// a backend reference loses no byte of its path/name (idx is the first-colon
+// offset; a negative idx means there was no colon).
+func assertClassifyReconstruct(t *testing.T, ref string, idx int, scheme, rest string) {
+	t.Helper()
+	if idx < 0 {
+		if scheme != ref || rest != "" {
+			t.Fatalf("malformed ref %q did not reconstruct: scheme=%q rest=%q", ref, scheme, rest)
+		}
+	} else if scheme+":"+rest != ref {
+		t.Fatalf("ref %q did not reconstruct from scheme=%q rest=%q", ref, scheme, rest)
+	}
+}
+
 // FuzzClassifyRef pins the key-reference scheme classifier that Load, Save, and
 // Delete share to route a reference to the file/keychain backend or reject it.
 // The reference is operator/config-influenced (it comes from cloak.keyRef), so
@@ -151,49 +209,10 @@ func FuzzClassifyRef(f *testing.F) {
 		// different mechanism than the implementation's strings.Cut. ':' is a
 		// single ASCII byte, so both split at the identical offset.
 		idx := strings.IndexByte(ref, ':')
-		var wantKind refKind
-		var wantScheme, wantRest string
-		if idx < 0 {
-			wantKind, wantScheme, wantRest = refMalformed, ref, ""
-		} else {
-			wantScheme, wantRest = ref[:idx], ref[idx+1:]
-			switch wantScheme {
-			case "file":
-				wantKind = refFile
-			case "keychain":
-				wantKind = refKeychain
-			default:
-				wantKind = refUnknown
-			}
-		}
-		if kind != wantKind || scheme != wantScheme || rest != wantRest {
-			t.Fatalf("classifyRef(%q) = (%d,%q,%q), want (%d,%q,%q)",
-				ref, kind, scheme, rest, wantKind, wantScheme, wantRest)
-		}
 
-		// Fail-closed: the result is always one of the four known kinds, and a
-		// backend is selected ONLY for an exact recognized scheme.
-		switch kind {
-		case refMalformed, refFile, refKeychain, refUnknown:
-		default:
-			t.Fatalf("classifyRef(%q) returned out-of-range kind %d", ref, kind)
-		}
-		if (kind == refFile) != (idx >= 0 && ref[:idx] == "file") {
-			t.Fatalf("refFile classification disagrees with an exact \"file\" scheme for %q", ref)
-		}
-		if (kind == refKeychain) != (idx >= 0 && ref[:idx] == "keychain") {
-			t.Fatalf("refKeychain classification disagrees with an exact \"keychain\" scheme for %q", ref)
-		}
-
-		// Faithful reconstruction: a backend reference loses no byte of its
-		// path/name; the classified pieces rebuild the original exactly.
-		if idx < 0 {
-			if scheme != ref || rest != "" {
-				t.Fatalf("malformed ref %q did not reconstruct: scheme=%q rest=%q", ref, scheme, rest)
-			}
-		} else if scheme+":"+rest != ref {
-			t.Fatalf("ref %q did not reconstruct from scheme=%q rest=%q", ref, scheme, rest)
-		}
+		assertClassifyOracle(t, ref, idx, kind, scheme, rest)
+		assertClassifyFailClosed(t, ref, idx, kind)
+		assertClassifyReconstruct(t, ref, idx, scheme, rest)
 
 		// Determinism.
 		if k2, s2, r2 := classifyRef(ref); k2 != kind || s2 != scheme || r2 != rest {

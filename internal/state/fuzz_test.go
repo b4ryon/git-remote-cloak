@@ -30,6 +30,7 @@ package state
 
 import (
 	"encoding/hex"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -169,46 +170,12 @@ func FuzzCheckPin(f *testing.F) {
 		// Independent oracle: re-derive the expected outcome straight from the
 		// inputs, never from CheckPin's body.
 		hashEqual := mHash == pinHash
-		wantErr := false
-		var wantKind cloakerr.Kind
-		switch {
-		case firstContact:
-			// trust-on-first-use: anything accepted before a pin exists.
-		case !mPresent:
-			wantErr, wantKind = true, cloakerr.Rollback // emptied remote
-		case mGen > pinGen:
-			// strict advance accepted
-		case mGen == pinGen:
-			if !hashEqual {
-				wantErr, wantKind = true, cloakerr.Tamper // changed without a bump
-			}
-		default:
-			wantErr, wantKind = true, cloakerr.Rollback // generation regression
-		}
+		wantErr, wantKind := wantPinVerdict(firstContact, mPresent, hashEqual, pinGen, mGen)
 
-		if wantErr != (got != nil) {
-			t.Fatalf("CheckPin(first=%v present=%v pinGen=%d mGen=%d hashEqual=%v) err=%v, want error=%v",
-				firstContact, mPresent, pinGen, mGen, hashEqual, got, wantErr)
-		}
-		if wantErr {
-			if k, _ := cloakerr.KindOf(got); k != wantKind {
-				t.Fatalf("CheckPin(first=%v present=%v pinGen=%d mGen=%d hashEqual=%v) kind=%v, want %v (err=%v)",
-					firstContact, mPresent, pinGen, mGen, hashEqual, k, wantKind, got)
-			}
-		}
-
-		// One-sided security floor, stated independently of the taxonomy above:
-		// once a pin exists, acceptance REQUIRES the remote to have strictly
-		// advanced (mGen > pinGen) or replayed the identical state (mGen == pinGen
-		// with the same hash). Any other accepted outcome would let a withholding
-		// or rolling-back host slip stale, emptied, or forged state past the gate.
-		if !firstContact && got == nil {
-			advanced := mPresent && (mGen > pinGen || (mGen == pinGen && hashEqual))
-			if !advanced {
-				t.Fatalf("CheckPin accepted a non-advancing pinned remote (present=%v pinGen=%d mGen=%d hashEqual=%v)",
-					mPresent, pinGen, mGen, hashEqual)
-			}
-		}
+		ctx := fmt.Sprintf("first=%v present=%v pinGen=%d mGen=%d hashEqual=%v",
+			firstContact, mPresent, pinGen, mGen, hashEqual)
+		assertPinVerdict(t, got, wantErr, wantKind, ctx)
+		assertPinSecurityFloor(t, got, firstContact, mPresent, pinGen, mGen, hashEqual)
 
 		// Deterministic: re-reading the unchanged pin yields the same verdict.
 		if again := d.CheckPin(m, mHash); (again != nil) != (got != nil) {
@@ -288,41 +255,11 @@ func FuzzCheckRepoID(f *testing.F) {
 		// before the pin (m == nil short-circuits in production), so it accepts
 		// regardless of whether a pin exists.
 		idEqual := mID == pinned
-		wantErr := false
-		switch {
-		case !mPresent:
-			// empty remote carries no manifest -> nothing to check
-		case firstContact:
-			// trust-on-first-use accepts the first id seen
-		case idEqual:
-			// matching pinned id accepted
-		default:
-			wantErr = true // substitution -> Tamper alarm
-		}
+		wantErr := wantRepoIDErr(firstContact, mPresent, idEqual)
 
-		if wantErr != (got != nil) {
-			t.Fatalf("CheckRepoID(first=%v present=%v idEqual=%v) err=%v, want error=%v",
-				firstContact, mPresent, idEqual, got, wantErr)
-		}
-		if wantErr {
-			if k, _ := cloakerr.KindOf(got); k != cloakerr.Tamper {
-				t.Fatalf("CheckRepoID(first=%v present=%v idEqual=%v) kind=%v, want Tamper (err=%v)",
-					firstContact, mPresent, idEqual, k, got)
-			}
-			// The substitution alarm wording the security suite greps for must
-			// survive any host-influenced id; asserted through the real consumer.
-			if !strings.Contains(got.Error(), "REPO IDENTITY MISMATCH") {
-				t.Fatalf("CheckRepoID mismatch alarm lost its wording: %q", got.Error())
-			}
-		}
-
-		// One-sided security floor, stated independently of the taxonomy above:
-		// once a repo id is pinned and the remote carries a manifest, acceptance
-		// REQUIRES an exact id match. Any other accepted outcome would let a host
-		// substitute a different repository past the gate.
-		if !firstContact && mPresent && got == nil && !idEqual {
-			t.Fatalf("CheckRepoID accepted a mismatched pinned repo id (pinned=%q mID=%q)", pinned, mID)
-		}
+		ctx := fmt.Sprintf("first=%v present=%v idEqual=%v", firstContact, mPresent, idEqual)
+		assertRepoIDVerdict(t, got, wantErr, ctx)
+		assertRepoIDSecurityFloor(t, got, firstContact, mPresent, idEqual, pinned, mID)
 
 		// Deterministic: CheckRepoID is read-only, so re-reading the unchanged
 		// pin yields the same verdict.
@@ -378,21 +315,7 @@ func FuzzLoadPin(f *testing.F) {
 		// hash: Sscanf "%d %s" cannot succeed without both a generation and a
 		// hash token, so a corrupt/truncated file is never accepted as a
 		// zero-generation pin that would slip a rollback past CheckPin.
-		switch {
-		case err != nil:
-			if ok {
-				t.Fatalf("LoadPin(%q) returned ok alongside an error: %v", raw, err)
-			}
-		case ok:
-			if p.ManifestHash == "" {
-				t.Fatalf("LoadPin(%q) accepted a pin with an empty hash: %+v", raw, p)
-			}
-			if strings.ContainsAny(p.ManifestHash, " \t\r\n") {
-				t.Fatalf("LoadPin(%q) accepted a hash carrying whitespace: %q", raw, p.ManifestHash)
-			}
-		default:
-			t.Fatalf("LoadPin(%q) reported no record though the file exists", raw)
-		}
+		assertLoadPinParse(t, raw, p, ok, err)
 
 		// Deterministic: re-reading the unchanged bytes yields the same verdict.
 		if p2, ok2, err2 := d.LoadPin(); ok2 != ok || (err2 != nil) != (err != nil) || p2 != p {
@@ -403,17 +326,7 @@ func FuzzLoadPin(f *testing.F) {
 		// --- Round-trip path: any Pin SavePin persists must LoadPin back
 		// byte-identically. The hash is derived as hex so it is a clean,
 		// non-empty, whitespace-free token the "%d %s" codec round-trips. ---
-		want := Pin{Generation: gen, ManifestHash: hex.EncodeToString([]byte(hashSeed)) + "0"}
-		if err := d.SavePin(want); err != nil {
-			t.Fatalf("SavePin(%+v): %v", want, err)
-		}
-		got, ok, err := d.LoadPin()
-		if err != nil || !ok {
-			t.Fatalf("LoadPin after SavePin(%+v): ok=%v err=%v", want, ok, err)
-		}
-		if got != want {
-			t.Fatalf("pin round-trip mismatch: saved %+v, loaded %+v", want, got)
-		}
+		assertSavedPinRoundTrips(t, d, gen, hashSeed)
 	})
 }
 
@@ -469,15 +382,7 @@ func FuzzAppliedSet(f *testing.F) {
 		// and is skipped just as FieldsFunc would have dropped it. maps.Equal then
 		// pins that every reported id is a trimmed non-empty line actually present
 		// (no fabrication), no line is dropped, and no empty id is ever a member.
-		want := map[string]bool{}
-		for _, fld := range strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' }) {
-			if tr := strings.TrimSpace(fld); tr != "" {
-				want[tr] = true
-			}
-		}
-		if !maps.Equal(got, want) {
-			t.Fatalf("AppliedSet(%q) = %v, want %v", raw, got, want)
-		}
+		assertAppliedParse(t, raw, got)
 
 		// Deterministic: re-reading the unchanged bytes yields an equal set.
 		if again, err := d.AppliedSet(); err != nil || !maps.Equal(again, got) {
@@ -489,25 +394,195 @@ func FuzzAppliedSet(f *testing.F) {
 		// set over successive fetches. The ids are derived as hex so they are clean,
 		// non-empty, whitespace-free tokens that survive the "<id>\n" round-trip
 		// byte-identically. ---
-		if err := os.Remove(appliedPath); err != nil && !os.IsNotExist(err) {
-			t.Fatalf("reset applied file: %v", err)
-		}
-		id1 := hex.EncodeToString([]byte(idSeed)) + "0" // clean, non-empty
-		id2 := id1 + "1"                                // a distinct clean id
-		if err := d.MarkApplied(id1, id2); err != nil {
-			t.Fatalf("MarkApplied(%q,%q): %v", id1, id2, err)
-		}
-		// A repeat mark is set-idempotent: the file grows by another line but the
-		// parsed set is unchanged, since packSkippable consumes a SET not a count.
-		if err := d.MarkApplied(id1); err != nil {
-			t.Fatalf("MarkApplied repeat: %v", err)
-		}
-		rt, err := d.AppliedSet()
-		if err != nil {
-			t.Fatalf("AppliedSet after MarkApplied: %v", err)
-		}
-		if wantRT := (map[string]bool{id1: true, id2: true}); !maps.Equal(rt, wantRT) {
-			t.Fatalf("applied round-trip mismatch: marked %v, got %v", wantRT, rt)
-		}
+		assertAppliedRoundTrips(t, d, appliedPath, idSeed)
 	})
+}
+
+// wantPinVerdict re-derives the expected CheckPin outcome (error? and which
+// alarm Kind) straight from the inputs, independent of CheckPin's body. It is
+// the trust-on-first-use / strict-advance / tamper / rollback taxonomy.
+func wantPinVerdict(firstContact, mPresent, hashEqual bool, pinGen, mGen uint64) (bool, cloakerr.Kind) {
+	switch {
+	case firstContact:
+		return false, 0 // trust-on-first-use: anything accepted before a pin exists
+	case !mPresent:
+		return true, cloakerr.Rollback // emptied remote
+	case mGen > pinGen:
+		return false, 0 // strict advance accepted
+	case mGen == pinGen:
+		if !hashEqual {
+			return true, cloakerr.Tamper // changed without a bump
+		}
+		return false, 0 // equal generation, same hash accepted
+	default:
+		return true, cloakerr.Rollback // generation regression
+	}
+}
+
+// assertPinVerdict checks CheckPin's error presence and (on error) its alarm
+// Kind against the independently derived expectation.
+func assertPinVerdict(t *testing.T, got error, wantErr bool, wantKind cloakerr.Kind, ctx string) {
+	t.Helper()
+	if wantErr != (got != nil) {
+		t.Fatalf("CheckPin(%s) err=%v, want error=%v", ctx, got, wantErr)
+	}
+	if wantErr {
+		if k, _ := cloakerr.KindOf(got); k != wantKind {
+			t.Fatalf("CheckPin(%s) kind=%v, want %v (err=%v)", ctx, k, wantKind, got)
+		}
+	}
+}
+
+// assertPinSecurityFloor states the one-sided security floor independently of
+// the taxonomy: once a pin exists, acceptance REQUIRES the remote to have
+// strictly advanced (mGen > pinGen) or replayed the identical state (mGen ==
+// pinGen with the same hash). Any other accepted outcome would let a
+// withholding or rolling-back host slip stale, emptied, or forged state past
+// the gate.
+func assertPinSecurityFloor(t *testing.T, got error, firstContact, mPresent bool, pinGen, mGen uint64, hashEqual bool) {
+	t.Helper()
+	if firstContact || got != nil {
+		return
+	}
+	advanced := mPresent && (mGen > pinGen || (mGen == pinGen && hashEqual))
+	if !advanced {
+		t.Fatalf("CheckPin accepted a non-advancing pinned remote (present=%v pinGen=%d mGen=%d hashEqual=%v)",
+			mPresent, pinGen, mGen, hashEqual)
+	}
+}
+
+// wantRepoIDErr re-derives whether CheckRepoID should reject, straight from the
+// inputs and independent of its body. The empty-remote case is checked before
+// the pin (m == nil short-circuits in production), so it accepts regardless of
+// whether a pin exists.
+func wantRepoIDErr(firstContact, mPresent, idEqual bool) bool {
+	switch {
+	case !mPresent:
+		return false // empty remote carries no manifest -> nothing to check
+	case firstContact:
+		return false // trust-on-first-use accepts the first id seen
+	case idEqual:
+		return false // matching pinned id accepted
+	default:
+		return true // substitution -> Tamper alarm
+	}
+}
+
+// assertRepoIDVerdict checks CheckRepoID's error presence and, on error, that
+// it is a Tamper alarm carrying the operator-visible "REPO IDENTITY MISMATCH"
+// wording the security suite greps for.
+func assertRepoIDVerdict(t *testing.T, got error, wantErr bool, ctx string) {
+	t.Helper()
+	if wantErr != (got != nil) {
+		t.Fatalf("CheckRepoID(%s) err=%v, want error=%v", ctx, got, wantErr)
+	}
+	if !wantErr {
+		return
+	}
+	if k, _ := cloakerr.KindOf(got); k != cloakerr.Tamper {
+		t.Fatalf("CheckRepoID(%s) kind=%v, want Tamper (err=%v)", ctx, k, got)
+	}
+	// The substitution alarm wording the security suite greps for must survive
+	// any host-influenced id; asserted through the real consumer.
+	if !strings.Contains(got.Error(), "REPO IDENTITY MISMATCH") {
+		t.Fatalf("CheckRepoID mismatch alarm lost its wording: %q", got.Error())
+	}
+}
+
+// assertRepoIDSecurityFloor states the one-sided floor independently of the
+// taxonomy: once a repo id is pinned and the remote carries a manifest,
+// acceptance REQUIRES an exact id match. Any other accepted outcome would let a
+// host substitute a different repository past the gate.
+func assertRepoIDSecurityFloor(t *testing.T, got error, firstContact, mPresent, idEqual bool, pinned, mID string) {
+	t.Helper()
+	if !firstContact && mPresent && got == nil && !idEqual {
+		t.Fatalf("CheckRepoID accepted a mismatched pinned repo id (pinned=%q mID=%q)", pinned, mID)
+	}
+}
+
+// assertLoadPinParse pins LoadPin's fail-closed contract over the just-written
+// on-disk bytes: the file exists, so ok==false must pair with a parse error and
+// ok==true with a clean parse that extracted a non-empty, whitespace-free hash
+// (so a corrupt/truncated file is never accepted as a zero-generation pin that
+// would slip a rollback past CheckPin).
+func assertLoadPinParse(t *testing.T, raw []byte, p Pin, ok bool, err error) {
+	t.Helper()
+	switch {
+	case err != nil:
+		if ok {
+			t.Fatalf("LoadPin(%q) returned ok alongside an error: %v", raw, err)
+		}
+	case ok:
+		if p.ManifestHash == "" {
+			t.Fatalf("LoadPin(%q) accepted a pin with an empty hash: %+v", raw, p)
+		}
+		if strings.ContainsAny(p.ManifestHash, " \t\r\n") {
+			t.Fatalf("LoadPin(%q) accepted a hash carrying whitespace: %q", raw, p.ManifestHash)
+		}
+	default:
+		t.Fatalf("LoadPin(%q) reported no record though the file exists", raw)
+	}
+}
+
+// assertSavedPinRoundTrips pins LoadPin's round-trip faithfulness: any Pin
+// SavePin persists LoadPin recovers byte-identically. The hash is derived as
+// hex so it is a clean, non-empty, whitespace-free token the "%d %s" codec
+// round-trips.
+func assertSavedPinRoundTrips(t *testing.T, d *Dir, gen uint64, hashSeed string) {
+	t.Helper()
+	want := Pin{Generation: gen, ManifestHash: hex.EncodeToString([]byte(hashSeed)) + "0"}
+	if err := d.SavePin(want); err != nil {
+		t.Fatalf("SavePin(%+v): %v", want, err)
+	}
+	got, ok, err := d.LoadPin()
+	if err != nil || !ok {
+		t.Fatalf("LoadPin after SavePin(%+v): ok=%v err=%v", want, ok, err)
+	}
+	if got != want {
+		t.Fatalf("pin round-trip mismatch: saved %+v, loaded %+v", want, got)
+	}
+}
+
+// assertAppliedParse pins AppliedSet's parse faithfulness against an
+// independent splitter (strings.FieldsFunc on '\n'): every reported id is a
+// trimmed non-empty line actually present (no fabrication), no line is dropped,
+// and no empty id is ever a member.
+func assertAppliedParse(t *testing.T, raw []byte, got map[string]bool) {
+	t.Helper()
+	want := map[string]bool{}
+	for _, fld := range strings.FieldsFunc(string(raw), func(r rune) bool { return r == '\n' }) {
+		if tr := strings.TrimSpace(fld); tr != "" {
+			want[tr] = true
+		}
+	}
+	if !maps.Equal(got, want) {
+		t.Fatalf("AppliedSet(%q) = %v, want %v", raw, got, want)
+	}
+}
+
+// assertAppliedRoundTrips exercises MarkApplied's create-then-grow from scratch,
+// exactly as production grows the applied set over successive fetches, and pins
+// that a repeat mark is set-idempotent (the file grows but the parsed set is
+// unchanged, since packSkippable consumes a SET not a count). The ids are
+// derived as hex so they survive the "<id>\n" round-trip byte-identically.
+func assertAppliedRoundTrips(t *testing.T, d *Dir, appliedPath, idSeed string) {
+	t.Helper()
+	if err := os.Remove(appliedPath); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("reset applied file: %v", err)
+	}
+	id1 := hex.EncodeToString([]byte(idSeed)) + "0" // clean, non-empty
+	id2 := id1 + "1"                                // a distinct clean id
+	if err := d.MarkApplied(id1, id2); err != nil {
+		t.Fatalf("MarkApplied(%q,%q): %v", id1, id2, err)
+	}
+	if err := d.MarkApplied(id1); err != nil {
+		t.Fatalf("MarkApplied repeat: %v", err)
+	}
+	rt, err := d.AppliedSet()
+	if err != nil {
+		t.Fatalf("AppliedSet after MarkApplied: %v", err)
+	}
+	if wantRT := (map[string]bool{id1: true, id2: true}); !maps.Equal(rt, wantRT) {
+		t.Fatalf("applied round-trip mismatch: marked %v, got %v", wantRT, rt)
+	}
 }

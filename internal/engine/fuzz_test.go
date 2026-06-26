@@ -178,76 +178,21 @@ func FuzzHeadForList(f *testing.F) {
 		}
 
 		// Membership (the safety invariant): the advertised HEAD is empty or a
-		// ref the manifest actually carries. Anything else tells git to check
-		// out a ref that does not exist.
-		if got != "" {
-			if _, ok := m.Refs[got]; !ok {
-				t.Fatalf("HeadForList = %q, which is not a ref in the manifest", got)
-			}
-			// A validated head is a branch and every fallback is a branch, so a
-			// non-empty result is always under refs/heads/.
-			if !strings.HasPrefix(got, "refs/heads/") {
-				t.Fatalf("HeadForList = %q, which is not a branch ref", got)
-			}
-		}
+		// ref the manifest actually carries.
+		assertHeadMembership(t, m, got)
 
 		// Independently characterize the branch set the selector ranges over.
-		hasBranch := false
-		minBranch := ""
-		hasMain, hasMaster := false, false
-		for name := range m.Refs {
-			if !strings.HasPrefix(name, "refs/heads/") {
-				continue
-			}
-			hasBranch = true
-			if minBranch == "" || name < minBranch {
-				minBranch = name
-			}
-			switch name {
-			case "refs/heads/main":
-				hasMain = true
-			case "refs/heads/master":
-				hasMaster = true
-			}
-		}
+		bs := headBranchStats(m.Refs)
 
 		// Emptiness is fully characterized by the branch set: HeadForList yields
 		// "" exactly when the manifest carries no branch (validation forces a
 		// live head to be a branch, so a head can never rescue a branchless one).
-		if (got == "") != !hasBranch {
-			t.Fatalf("HeadForList = %q but hasBranch = %v", got, hasBranch)
+		if (got == "") != !bs.hasBranch {
+			t.Fatalf("HeadForList = %q but hasBranch = %v", got, bs.hasBranch)
 		}
 
-		// Priority. A head that names a live ref always wins outright.
-		if _, headLive := m.Refs[head]; head != "" && headLive {
-			if got != head {
-				t.Fatalf("live head %q present but HeadForList = %q", head, got)
-			}
-			return
-		}
-		// Otherwise the selector ranges over branches only: main, then master,
-		// then the lexicographically smallest branch. The last is asserted as a
-		// universal minimum (got <= every branch) rather than by re-sorting, so
-		// it does not merely restate firstBranch's implementation.
-		switch {
-		case hasMain:
-			if got != "refs/heads/main" {
-				t.Fatalf("main present (no live head) but HeadForList = %q", got)
-			}
-		case hasMaster:
-			if got != "refs/heads/master" {
-				t.Fatalf("master present (no live head/main) but HeadForList = %q", got)
-			}
-		case hasBranch:
-			if got != minBranch {
-				t.Fatalf("HeadForList = %q, want smallest branch %q", got, minBranch)
-			}
-			for name := range m.Refs {
-				if strings.HasPrefix(name, "refs/heads/") && got > name {
-					t.Fatalf("HeadForList = %q is not the smallest branch; %q sorts before it", got, name)
-				}
-			}
-		}
+		// Priority order: live head, then main, master, smallest branch.
+		assertHeadPriority(t, m, bs, head, got)
 	})
 }
 
@@ -403,58 +348,16 @@ func FuzzPackSkippable(f *testing.F) {
 		closure := func() bool { return closureResult }
 		got := e.packSkippable(p, applied, closure)
 
-		// Composition: the gate is exactly "covered OR local closure complete".
-		if want := covered || closureResult; got != want {
-			t.Fatalf("packSkippable = %v, want %v (covered=%v closure=%v)",
-				got, want, covered, closureResult)
-		}
-
-		// One-sided safety: if the pack is skipped while the local closure is
-		// NOT complete, the skip can only be justified by full replaces cover,
-		// so every superseded pack MUST already be applied -- the pack delivers
-		// nothing new. A skip without that justification would drop real objects.
-		if got && !closureResult {
-			if len(replaces) == 0 {
-				t.Fatalf("skipped a pack with no predecessors and no local closure")
-			}
-			for _, r := range replaces {
-				if !appliedSet[r] {
-					t.Fatalf("skipped a pack while predecessor %q is not applied", r)
-				}
-			}
-		}
-
-		// Base case: a pack with no predecessors is never covered, so the gate
-		// reduces to the local-closure verdict alone.
-		if len(replaces) == 0 {
-			if covered {
-				t.Fatalf("replacesCovered = true for a pack with no predecessors")
-			}
-			if got != closureResult {
-				t.Fatalf("empty-replaces gate = %v, want closure %v", got, closureResult)
-			}
-		}
+		// Composition, one-sided safety, and the empty-replaces base case.
+		assertSkippableSafety(t, got, covered, closureResult, replaces, appliedSet)
 
 		// Determinism: a pure decision must repeat.
 		if again := e.packSkippable(p, applied, closure); again != got {
 			t.Fatalf("packSkippable not deterministic: %v then %v", got, again)
 		}
 
-		// Monotonicity toward full cover: marking EVERY predecessor applied can
-		// only ever make a non-empty pack covered, never un-cover one already
-		// covered. This catches an AND/OR or loop-bound inversion that the
-		// equality check above might miss on inputs where the subsets coincide.
-		full := map[string]bool{}
-		for _, r := range replaces {
-			full[r] = true
-		}
-		fullCovered := replacesCovered(p, full)
-		if fullCovered != (len(replaces) > 0) {
-			t.Fatalf("replacesCovered with all applied = %v, want %v", fullCovered, len(replaces) > 0)
-		}
-		if covered && !fullCovered {
-			t.Fatalf("covered under a subset but not under the full applied set")
-		}
+		// Monotonicity: marking EVERY predecessor applied never un-covers a pack.
+		assertSkippableMonotonic(t, p, replaces, covered)
 	})
 }
 
@@ -639,19 +542,9 @@ func FuzzPlanRefUpdatesDeletes(f *testing.F) {
 		// empty name. Src is always "" -> every update is a delete.
 		updates := make([]RefUpdate, 0, len(dstSeq))
 		for i, b := range dstSeq {
-			n := int(b) % (len(pool) + 2)
-			var dst string
-			switch {
-			case n < len(pool):
-				dst = pool[n]
-			case n == len(pool):
-				dst = absent
-			default:
-				dst = ""
-			}
 			updates = append(updates, RefUpdate{
 				Src:   "",
-				Dst:   dst,
+				Dst:   pickCandidate(b, pool, absent),
 				Force: forceMask&(uint16(1)<<uint(i%16)) != 0,
 			})
 		}
@@ -666,44 +559,9 @@ func FuzzPlanRefUpdatesDeletes(f *testing.F) {
 			t.Fatalf("planRefUpdates mutated its input remoteRefs map: before=%v after=%v", before, remoteRefs)
 		}
 
-		// One result per update, in order, each reporting its own Dst.
-		if len(results) != len(updates) {
-			t.Fatalf("got %d results, want %d", len(results), len(updates))
-		}
-
-		// Independent verdict: a delete is accepted iff its target is present in
-		// the ORIGINAL remote ref set (decideRef reads remoteRefs, never the
-		// running projection, so a duplicate delete of a present ref is accepted
-		// every time). Project the accepted deletes out of a fresh copy.
-		wantAccepted := 0
-		wantNew := maps.Clone(before)
-		for i, u := range updates {
-			_, present := before[u.Dst]
-			if results[i].Dst != u.Dst {
-				t.Fatalf("results[%d].Dst = %q, want %q", i, results[i].Dst, u.Dst)
-			}
-			if present {
-				wantAccepted++
-				delete(wantNew, u.Dst)
-				if results[i].Err != "" {
-					t.Fatalf("accepted delete of %q reported Err %q, want empty", u.Dst, results[i].Err)
-				}
-			} else if results[i].Err != "remote ref does not exist" {
-				t.Fatalf("rejected delete of %q reported Err %q, want %q",
-					u.Dst, results[i].Err, "remote ref does not exist")
-			}
-		}
-
-		if accepted != wantAccepted {
-			t.Fatalf("accepted = %d, want %d", accepted, wantAccepted)
-		}
-		// A delete never contributes a pack want.
-		if len(wants) != 0 {
-			t.Fatalf("deletes produced %d pack wants, want 0: %v", len(wants), wants)
-		}
-		if !maps.Equal(newRefs, wantNew) {
-			t.Fatalf("newRefs = %v, want %v", newRefs, wantNew)
-		}
+		// Authorization, projection, accepted count, and pack-want freedom, each
+		// re-derived against the ORIGINAL remote ref set.
+		assertDeletePlan(t, results, newRefs, wants, accepted, updates, before)
 
 		// Determinism: the same batch re-plans to the same projection.
 		results2, newRefs2, wants2, accepted2 := e.planRefUpdates(remoteRefs, updates)
@@ -774,36 +632,9 @@ func FuzzRepackManifest(f *testing.F) {
 
 		man := repackManifest(cur, newID, newSize)
 
-		// Generation bumped by exactly one (rollback protection; acceptRepack
-		// persists man.Generation as the new pin). uint64 wraps consistently.
-		if man.Generation != gen+1 {
-			t.Fatalf("generation = %d, want %d", man.Generation, gen+1)
-		}
-		// Exactly one pack: the merged pack with the given id/size.
-		if len(man.Packs) != 1 {
-			t.Fatalf("got %d packs, want exactly 1", len(man.Packs))
-		}
-		if man.Packs[0].ID != newID || man.Packs[0].Size != newSize {
-			t.Fatalf("merged pack = {%q, %d}, want {%q, %d}",
-				man.Packs[0].ID, man.Packs[0].Size, newID, newSize)
-		}
-		// Replaces lists every prior pack id, in order, with no drop/dup/reorder.
-		if !slices.Equal(man.Packs[0].Replaces, wantOldIDs) {
-			t.Fatalf("Replaces = %v, want %v", man.Packs[0].Replaces, wantOldIDs)
-		}
-		// Carry-over: version, repo identity, head and refs unchanged.
-		if man.Version != manifest.Version {
-			t.Fatalf("version = %d, want %d", man.Version, manifest.Version)
-		}
-		if man.RepoID != repoID {
-			t.Fatalf("RepoID = %q, want %q (must survive a repack unchanged)", man.RepoID, repoID)
-		}
-		if man.Head != head {
-			t.Fatalf("Head = %q, want %q", man.Head, head)
-		}
-		if !maps.Equal(man.Refs, snapRefs) {
-			t.Fatalf("Refs = %v, want %v", man.Refs, snapRefs)
-		}
+		// Generation bump, single merged pack carrying every prior id as Replaces,
+		// and carry-over of version/repo-id/head/refs.
+		assertRepackResult(t, man, gen, newID, newSize, wantOldIDs, repoID, head, snapRefs)
 
 		// Isolation: scribbling the result must not corrupt cur's manifest
 		// (repackOnce keeps using cur on a lost-CAS retry).
@@ -815,22 +646,7 @@ func FuzzRepackManifest(f *testing.F) {
 		if len(man.Packs[0].Replaces) > 0 {
 			man.Packs[0].Replaces[0] = "MUTATED"
 		}
-		if cur.Manifest.Generation != gen {
-			t.Fatalf("repackManifest mutated cur generation: %d != %d", cur.Manifest.Generation, gen)
-		}
-		if cur.Manifest.RepoID != repoID || cur.Manifest.Head != head {
-			t.Fatalf("repackManifest mutated cur meta")
-		}
-		if !maps.Equal(cur.Manifest.Refs, snapRefs) {
-			t.Fatalf("repackManifest leaked into cur.Refs: %v", cur.Manifest.Refs)
-		}
-		curOldIDs := make([]string, 0, len(cur.Manifest.Packs))
-		for _, p := range cur.Manifest.Packs {
-			curOldIDs = append(curOldIDs, p.ID)
-		}
-		if !slices.Equal(curOldIDs, wantOldIDs) {
-			t.Fatalf("repackManifest mutated cur packs: %v want %v", curOldIDs, wantOldIDs)
-		}
+		assertCurUnmutated(t, cur, gen, repoID, head, snapRefs, wantOldIDs)
 
 		// Determinism: cur is now verified clean, so a re-build reproduces it.
 		man2 := repackManifest(cur, newID, newSize)
@@ -905,50 +721,12 @@ func FuzzNextPushManifest(f *testing.F) {
 
 		man := nextPushManifest(base, newRefs, head, newID, newSize)
 
-		// Generation bumped by exactly one (rollback protection; persistPushed
-		// records man.Generation as the new pin). uint64 wraps consistently.
-		if man.Generation != gen+1 {
-			t.Fatalf("generation = %d, want %d", man.Generation, gen+1)
-		}
-		// Refs installed wholesale: the published set is exactly newRefs, never a
-		// merge with base.Refs (base carried only refs/heads/base-only).
-		if !maps.Equal(man.Refs, wantNewRefs) {
-			t.Fatalf("Refs = %v, want %v", man.Refs, wantNewRefs)
-		}
-		// Head installed verbatim.
-		if man.Head != head {
-			t.Fatalf("Head = %q, want %q", man.Head, head)
-		}
-		// Carry-over: version and repo identity survive a push unchanged.
-		if man.Version != manifest.Version {
-			t.Fatalf("version = %d, want %d", man.Version, manifest.Version)
-		}
-		if man.RepoID != repoID {
-			t.Fatalf("RepoID = %q, want %q (must survive a push unchanged)", man.RepoID, repoID)
-		}
-		// Pack continuity: every prior pack is retained in order, then the new
-		// pack is appended iff packID != "". A normal push adds a pack, it never
-		// drops a live one -- a dropped pack would lose access to its objects.
-		wantPackCount := len(oldPacks)
-		if newID != "" {
-			wantPackCount++
-		}
-		if len(man.Packs) != wantPackCount {
-			t.Fatalf("got %d packs, want %d", len(man.Packs), wantPackCount)
-		}
-		for i := range oldPacks {
-			if man.Packs[i].ID != wantOldIDs[i] || man.Packs[i].Size != wantOldSizes[i] {
-				t.Fatalf("prior pack %d = {%q,%d}, want {%q,%d} (continuity)",
-					i, man.Packs[i].ID, man.Packs[i].Size, wantOldIDs[i], wantOldSizes[i])
-			}
-		}
-		if newID != "" {
-			np := man.Packs[len(oldPacks)]
-			if np.ID != newID || np.Size != newSize || len(np.Replaces) != 0 {
-				t.Fatalf("appended pack = {%q,%d,replaces=%v}, want {%q,%d,nil}",
-					np.ID, np.Size, np.Replaces, newID, newSize)
-			}
-		}
+		// Generation bump, wholesale install of the published ref set/head, and
+		// carry-over of version/repo identity.
+		assertPushInstall(t, man, gen, wantNewRefs, head, repoID)
+		// Pack continuity: every prior pack retained in order, the new pack
+		// appended iff packID != "".
+		assertPackContinuity(t, man, wantOldIDs, wantOldSizes, newID, newSize)
 
 		// Isolation: scribbling the result must not corrupt base (pushOnce keeps
 		// using cur on a lost-CAS retry; base may alias the cached remote state).
@@ -959,25 +737,15 @@ func FuzzNextPushManifest(f *testing.F) {
 		for i := range man.Packs {
 			man.Packs[i].ID = "MUTATED"
 		}
-		if base.Generation != gen || base.RepoID != repoID {
-			t.Fatalf("nextPushManifest mutated base meta")
-		}
-		if !maps.Equal(base.Refs, snapBaseRefs) {
-			t.Fatalf("nextPushManifest leaked into base.Refs: %v", base.Refs)
-		}
-		baseIDs := make([]string, 0, len(base.Packs))
-		for _, p := range base.Packs {
-			baseIDs = append(baseIDs, p.ID)
-		}
-		if !slices.Equal(baseIDs, wantOldIDs) {
-			t.Fatalf("nextPushManifest mutated base packs: %v want %v", baseIDs, wantOldIDs)
-		}
+		assertBaseUnmutated(t, base, gen, repoID, snapBaseRefs, wantOldIDs)
 
 		// Determinism: base is verified clean, so a rebuild reproduces the result
 		// (a fresh newRefs clone, since the scribble above mutated the aliased one).
+		// The scribble left man.Packs's length intact, so it stands in for the
+		// expected pack count.
 		man2 := nextPushManifest(base, maps.Clone(wantNewRefs), head, newID, newSize)
 		if man2.Generation != gen+1 || man2.Head != head || man2.RepoID != repoID ||
-			!maps.Equal(man2.Refs, wantNewRefs) || len(man2.Packs) != wantPackCount {
+			!maps.Equal(man2.Refs, wantNewRefs) || len(man2.Packs) != len(man.Packs) {
 			t.Fatalf("nextPushManifest not deterministic")
 		}
 	})
@@ -1004,19 +772,8 @@ func FuzzSelectManifestHead(f *testing.F) {
 		"refs/tags/v1",
 	}
 	const offPool = "refs/heads/__off__" // never added to refs
-	// pick maps a selector byte to a candidate: a pool ref, the off-pool name,
-	// or "". So local/prevHead range over present, absent, and empty values.
-	pick := func(sel uint8) string {
-		n := int(sel) % (len(pool) + 2)
-		switch {
-		case n < len(pool):
-			return pool[n]
-		case n == len(pool):
-			return offPool
-		default:
-			return ""
-		}
-	}
+	// pickCandidate maps each selector byte to a pool ref, the off-pool name, or
+	// "", so local/prevHead range over present, absent, and empty values.
 
 	// Seeds: local present (wins), local absent with prev present (prev wins),
 	// local present AND prev present (local still wins), neither usable (empty),
@@ -1038,8 +795,8 @@ func FuzzSelectManifestHead(f *testing.F) {
 				refs[name] = oid
 			}
 		}
-		local := pick(localSel)
-		prevHead := pick(prevSel)
+		local := pickCandidate(localSel, pool, offPool)
+		prevHead := pickCandidate(prevSel, pool, offPool)
 
 		var prev *manifest.Manifest
 		if hasPrev {
@@ -1049,48 +806,19 @@ func FuzzSelectManifestHead(f *testing.F) {
 
 		got := selectManifestHead(local, localOK, prev, refs)
 
-		// Independent membership predicate over a separately-built key set.
-		inRefs := func(name string) bool { _, ok := refs[name]; return ok }
+		// Membership safety and provenance: a non-empty head is always a ref the
+		// manifest carries, and only ever one of the two candidate inputs.
+		assertSelectHeadSafety(t, got, local, prevHead, hasPrev, refs)
 
-		// Membership safety (the load-bearing invariant): a non-empty head is
-		// always a ref the manifest actually carries. A head naming an absent ref
-		// is exactly the dangling-HEAD-on-clone harm this guards against.
-		if got != "" && !inRefs(got) {
-			t.Fatalf("selectManifestHead = %q, which is not in the ref set %v", got, refs)
-		}
+		// Whether each candidate is usable, derived independently of the cascade
+		// (a separate map read, not selectManifestHead's own membership test).
+		_, localInRefs := refs[local]
+		_, prevInRefs := refs[prevHead]
+		localUsable := localOK && localInRefs
+		prevUsable := hasPrev && prevHead != "" && prevInRefs
 
-		// Provenance: the result can only ever be one of its two candidate inputs
-		// or empty -- it never invents a name.
-		if got != "" && got != local && !(hasPrev && got == prevHead) {
-			t.Fatalf("selectManifestHead = %q, neither local %q nor prev head %q", got, local, prevHead)
-		}
-
-		// Whether each candidate is usable, derived independently of the cascade.
-		localUsable := localOK && inRefs(local)
-		prevUsable := hasPrev && prevHead != "" && inRefs(prevHead)
-
-		switch {
-		case localUsable:
-			// Local HEAD's branch wins outright, even when prev is also usable.
-			if got != local {
-				t.Fatalf("local %q is usable but selectManifestHead = %q", local, got)
-			}
-		case prevUsable:
-			// Prev head is the fallback, consulted only because local was unusable.
-			if got != prevHead {
-				t.Fatalf("local unusable and prev %q usable but selectManifestHead = %q", prevHead, got)
-			}
-		default:
-			// No usable candidate => no head.
-			if got != "" {
-				t.Fatalf("no usable candidate but selectManifestHead = %q", got)
-			}
-		}
-
-		// Emptiness is fully characterized: a head iff some candidate is usable.
-		if (got == "") == (localUsable || prevUsable) {
-			t.Fatalf("got = %q but localUsable=%v prevUsable=%v", got, localUsable, prevUsable)
-		}
+		// Priority cascade (local wins, else prev, else none) and emptiness.
+		assertSelectHeadCascade(t, got, local, prevHead, localUsable, prevUsable)
 
 		// Determinism: a pure selector must repeat.
 		if again := selectManifestHead(local, localOK, prev, refs); again != got {
@@ -1317,12 +1045,6 @@ func FuzzConsolidatedPacks(f *testing.F) {
 	f.Add([]byte{0, 1}, []byte{6, 7}, id64, int64(123))
 	f.Add([]byte{}, []byte{0}, id64, int64(5))
 
-	// packEqual compares packs including the Replaces slice field (survivors are
-	// carried over verbatim, so their Replaces must survive too).
-	packEqual := func(a, b manifest.Pack) bool {
-		return a.ID == b.ID && a.Size == b.Size && slices.Equal(a.Replaces, b.Replaces)
-	}
-
 	f.Fuzz(func(t *testing.T, livePackSeed, victimSeed []byte, mergedID string, mergedSize int64) {
 		// Live pack set: one pack per livePackSeed byte (id from the pool,
 		// duplicates allowed exactly as a live manifest may carry, a distinct Size
@@ -1349,71 +1071,24 @@ func FuzzConsolidatedPacks(f *testing.F) {
 
 		got := consolidatedPacks(packs, victimIDs, mergedID, mergedSize)
 
-		// Independent victim membership: a linear scan (slices.Contains) rather than
-		// the implementation's map lookup, so a victim-set build bug is caught.
-		isVictim := func(id string) bool { return slices.Contains(victimIDs, id) }
-
+		// Independent survivor set: the live packs whose id is not a victim (a
+		// linear slices.Contains scan, not the implementation's map lookup, so a
+		// victim-set build bug is caught).
 		var wantSurvivors []manifest.Pack
 		for _, p := range packs {
-			if !isVictim(p.ID) {
+			if !slices.Contains(victimIDs, p.ID) {
 				wantSurvivors = append(wantSurvivors, p)
 			}
 		}
 
-		// Exactly the survivors plus the one merged pack, merged appended last.
-		if len(got) != len(wantSurvivors)+1 {
-			t.Fatalf("got %d packs, want %d survivors + 1 merged", len(got), len(wantSurvivors))
-		}
-		// Survivors retained verbatim, in original order (ID, Size, Replaces).
-		for i := range wantSurvivors {
-			if !packEqual(got[i], wantSurvivors[i]) {
-				t.Fatalf("survivor %d = %+v, want %+v", i, got[i], wantSurvivors[i])
-			}
-		}
-		// Merged pack: id/size verbatim, Replaces == the victim list in order with
-		// no drop/dup/reorder (the supersession record packSkippable consults).
-		merged := got[len(got)-1]
-		if merged.ID != mergedID || merged.Size != mergedSize {
-			t.Fatalf("merged pack = {%q,%d}, want {%q,%d}", merged.ID, merged.Size, mergedID, mergedSize)
-		}
-		if !slices.Equal(merged.Replaces, victimIDs) {
-			t.Fatalf("merged Replaces = %v, want %v", merged.Replaces, victimIDs)
-		}
-
-		// Load-bearing consolidation-correctness harm statement: every live pack is
-		// either retained as a survivor or declared superseded in the merged pack's
-		// Replaces. A live pack that vanished without being listed in Replaces would
-		// be lost to a client that had not applied it (it would never re-download
-		// it -- packSkippable treats a fully-replaced pack as already covered).
-		survivors := got[:len(got)-1]
-		for _, p := range packs {
-			retained := slices.ContainsFunc(survivors, func(s manifest.Pack) bool { return s.ID == p.ID })
-			if !retained && !slices.Contains(merged.Replaces, p.ID) {
-				t.Fatalf("live pack %q neither retained nor superseded in Replaces", p.ID)
-			}
-		}
-		// Dual: no surviving (non-merged) pack is a victim -- the victims must
-		// actually be dropped, or the consolidation publishes a pack it claims to
-		// have folded away.
-		for _, s := range survivors {
-			if isVictim(s.ID) {
-				t.Fatalf("victim pack %q survived the consolidation", s.ID)
-			}
-		}
-
-		// No input mutation: consolidatedPacks reads packs/victimIDs and builds a
-		// fresh slice (applyConsolidation hands it the live plan.man.Packs).
-		if len(packs) != len(packsSnap) {
-			t.Fatalf("packs slice length changed: %d != %d", len(packs), len(packsSnap))
-		}
-		for i := range packs {
-			if !packEqual(packs[i], packsSnap[i]) {
-				t.Fatalf("packs[%d] mutated", i)
-			}
-		}
-		if !slices.Equal(victimIDs, victimSnap) {
-			t.Fatalf("victimIDs mutated: %v want %v", victimIDs, victimSnap)
-		}
+		// Shape: survivors verbatim in order, then the one merged pack carrying
+		// the victim list as Replaces.
+		assertConsolidatedShape(t, got, wantSurvivors, mergedID, mergedSize, victimIDs)
+		// Load-bearing harm statement: every live pack is retained or superseded,
+		// and no survivor is itself a victim.
+		assertConsolidationComplete(t, got, packs, victimIDs)
+		// No input mutation: packs/victimIDs survive the call unchanged.
+		assertConsolidatedNoMutation(t, packs, packsSnap, victimIDs, victimSnap)
 
 		// Determinism: a fresh copy of the inputs reproduces the same pack set.
 		got2 := consolidatedPacks(slices.Clone(packs), slices.Clone(victimIDs), mergedID, mergedSize)
@@ -1421,7 +1096,7 @@ func FuzzConsolidatedPacks(f *testing.F) {
 			t.Fatalf("consolidatedPacks not deterministic (len %d != %d)", len(got2), len(got))
 		}
 		for i := range got {
-			if !packEqual(got2[i], got[i]) {
+			if !packFieldsEqual(got2[i], got[i]) {
 				t.Fatalf("consolidatedPacks not deterministic at %d", i)
 			}
 		}
@@ -1493,45 +1168,8 @@ func FuzzCanMarkConsolidated(f *testing.F) {
 
 		gotIDs, gotCanMark := canMarkConsolidated(victims, notYetPushedID, applied)
 
-		// victimIDs == the victim ids in order, no drop/dup/reorder.
-		wantIDs := make([]string, 0, len(victims))
-		for _, v := range victims {
-			wantIDs = append(wantIDs, v.ID)
-		}
-		if !slices.Equal(gotIDs, wantIDs) {
-			t.Fatalf("victimIDs = %v, want %v", gotIDs, wantIDs)
-		}
-
-		// Independent decomposition: build the covered set as a UNION (every
-		// applied id plus the not-yet-pushed id), then canMark IFF every victim is
-		// covered. This is a different shape than the implementation's per-victim
-		// "not-the-pushed-pack AND not-applied -> false" flip.
-		covered := maps.Clone(applied)
-		covered[notYetPushedID] = true
-		wantCanMark := true
-		for _, v := range victims {
-			if !covered[v.ID] {
-				wantCanMark = false
-				break
-			}
-		}
-		if gotCanMark != wantCanMark {
-			t.Fatalf("canMark = %v, want %v (victims=%v notYet=%q applied=%v)",
-				gotCanMark, wantCanMark, wantIDs, notYetPushedID, applied)
-		}
-
-		// Load-bearing one-sided floor (the harm statement): when canMark is true,
-		// EVERY victim must be covered -- either the not-yet-pushed pack or already
-		// applied. A canMark=true that let a never-applied, non-pushed victim
-		// through would mark the merged pack applied with its objects absent
-		// locally, skipping a download the repo actually needs (forever).
-		if gotCanMark {
-			for _, v := range victims {
-				if v.ID != notYetPushedID && !applied[v.ID] {
-					t.Fatalf("canMark=true but victim %q is neither the not-yet-pushed pack nor applied", v.ID)
-				}
-			}
-		}
+		// victimIDs order, the covered-as-union verdict, and the one-sided floor.
+		assertCanMarkVerdict(t, gotIDs, gotCanMark, victims, notYetPushedID, applied)
 
 		// Determinism: same inputs, same answer.
 		gotIDs2, gotCanMark2 := canMarkConsolidated(victims, notYetPushedID, applied)
@@ -1539,19 +1177,489 @@ func FuzzCanMarkConsolidated(f *testing.F) {
 			t.Fatalf("canMarkConsolidated not deterministic")
 		}
 
-		// No input mutation: it reads applied and victims and builds a fresh slice.
-		// (manifest.Pack carries a slice field so it is not comparable; compare the
-		// fields this target sets -- ID and Size, Replaces is always nil here.)
-		if len(victims) != len(victimSnap) {
-			t.Fatalf("victims slice length changed: %d != %d", len(victims), len(victimSnap))
+		// No input mutation: victims and applied survive the call unchanged.
+		assertCanMarkNoMutation(t, victims, victimSnap, applied, appliedSnap)
+	})
+}
+
+// pickCandidate maps a fuzz selector byte to one of three classes of value: a
+// pool entry (so it may collide with a present ref/pack), the off-pool sentinel,
+// or "". Shared by the delete-target and head-candidate fuzzers, whose selection
+// shape is identical.
+func pickCandidate(sel uint8, pool []string, sentinel string) string {
+	n := int(sel) % (len(pool) + 2)
+	switch {
+	case n < len(pool):
+		return pool[n]
+	case n == len(pool):
+		return sentinel
+	default:
+		return ""
+	}
+}
+
+// packFieldsEqual compares two packs by every field including the Replaces slice
+// (survivors are carried over verbatim, so their Replaces must survive too).
+func packFieldsEqual(a, b manifest.Pack) bool {
+	return a.ID == b.ID && a.Size == b.Size && slices.Equal(a.Replaces, b.Replaces)
+}
+
+// headBranchInfo characterizes the refs/heads/ subset of a manifest's ref set
+// that HeadForList's fallback selection ranges over.
+type headBranchInfo struct {
+	hasBranch          bool
+	minBranch          string
+	hasMain, hasMaster bool
+}
+
+// headBranchStats independently derives the branch set HeadForList selects over:
+// whether any branch exists, the lexicographically smallest one, and whether the
+// two privileged names are present.
+func headBranchStats(refs map[string]string) headBranchInfo {
+	var bs headBranchInfo
+	for name := range refs {
+		if !strings.HasPrefix(name, "refs/heads/") {
+			continue
 		}
-		for i := range victims {
-			if victims[i].ID != victimSnap[i].ID || victims[i].Size != victimSnap[i].Size {
-				t.Fatalf("victims[%d] mutated", i)
+		bs.hasBranch = true
+		if bs.minBranch == "" || name < bs.minBranch {
+			bs.minBranch = name
+		}
+		switch name {
+		case "refs/heads/main":
+			bs.hasMain = true
+		case "refs/heads/master":
+			bs.hasMaster = true
+		}
+	}
+	return bs
+}
+
+// assertHeadMembership pins HeadForList's load-bearing safety invariant: a
+// non-empty advertised HEAD must name a ref the manifest actually carries, and a
+// validated/fallback head is always a branch.
+func assertHeadMembership(t *testing.T, m *manifest.Manifest, got string) {
+	t.Helper()
+	if got == "" {
+		return
+	}
+	if _, ok := m.Refs[got]; !ok {
+		t.Fatalf("HeadForList = %q, which is not a ref in the manifest", got)
+	}
+	// A validated head is a branch and every fallback is a branch, so a non-empty
+	// result is always under refs/heads/.
+	if !strings.HasPrefix(got, "refs/heads/") {
+		t.Fatalf("HeadForList = %q, which is not a branch ref", got)
+	}
+}
+
+// assertHeadPriority pins HeadForList's documented priority: a live head wins
+// outright, else main, else master, else the lexicographically smallest branch
+// (asserted as a universal minimum rather than by re-sorting, so it does not
+// merely restate the implementation).
+func assertHeadPriority(t *testing.T, m *manifest.Manifest, bs headBranchInfo, head, got string) {
+	t.Helper()
+	// A head that names a live ref always wins outright.
+	if _, headLive := m.Refs[head]; head != "" && headLive {
+		if got != head {
+			t.Fatalf("live head %q present but HeadForList = %q", head, got)
+		}
+		return
+	}
+	// Otherwise the selector ranges over branches only.
+	switch {
+	case bs.hasMain:
+		if got != "refs/heads/main" {
+			t.Fatalf("main present (no live head) but HeadForList = %q", got)
+		}
+	case bs.hasMaster:
+		if got != "refs/heads/master" {
+			t.Fatalf("master present (no live head/main) but HeadForList = %q", got)
+		}
+	case bs.hasBranch:
+		if got != bs.minBranch {
+			t.Fatalf("HeadForList = %q, want smallest branch %q", got, bs.minBranch)
+		}
+		for name := range m.Refs {
+			if strings.HasPrefix(name, "refs/heads/") && got > name {
+				t.Fatalf("HeadForList = %q is not the smallest branch; %q sorts before it", got, name)
 			}
 		}
-		if !maps.Equal(applied, appliedSnap) {
-			t.Fatalf("applied map mutated")
+	}
+}
+
+// assertPushInstall pins nextPushManifest's install contract: the generation is
+// bumped by exactly one, the published ref set and head are installed wholesale
+// (never merged with base), and version/repo identity carry forward unchanged.
+func assertPushInstall(t *testing.T, man *manifest.Manifest, gen uint64, wantRefs map[string]string, head, repoID string) {
+	t.Helper()
+	if man.Generation != gen+1 {
+		t.Fatalf("generation = %d, want %d", man.Generation, gen+1)
+	}
+	if !maps.Equal(man.Refs, wantRefs) {
+		t.Fatalf("Refs = %v, want %v", man.Refs, wantRefs)
+	}
+	if man.Head != head {
+		t.Fatalf("Head = %q, want %q", man.Head, head)
+	}
+	if man.Version != manifest.Version {
+		t.Fatalf("version = %d, want %d", man.Version, manifest.Version)
+	}
+	if man.RepoID != repoID {
+		t.Fatalf("RepoID = %q, want %q (must survive a push unchanged)", man.RepoID, repoID)
+	}
+}
+
+// assertPackContinuity pins the pack-continuity invariant: every prior pack is
+// retained in order, then the new pack is appended iff newID != "" (a push adds
+// a pack, it never drops a live one, or clients lose access to its objects).
+func assertPackContinuity(t *testing.T, man *manifest.Manifest, wantOldIDs []string, wantOldSizes []int64, newID string, newSize int64) {
+	t.Helper()
+	wantPackCount := len(wantOldIDs)
+	if newID != "" {
+		wantPackCount++
+	}
+	if len(man.Packs) != wantPackCount {
+		t.Fatalf("got %d packs, want %d", len(man.Packs), wantPackCount)
+	}
+	for i := range wantOldIDs {
+		if man.Packs[i].ID != wantOldIDs[i] || man.Packs[i].Size != wantOldSizes[i] {
+			t.Fatalf("prior pack %d = {%q,%d}, want {%q,%d} (continuity)",
+				i, man.Packs[i].ID, man.Packs[i].Size, wantOldIDs[i], wantOldSizes[i])
 		}
-	})
+	}
+	if newID != "" {
+		np := man.Packs[len(wantOldIDs)]
+		if np.ID != newID || np.Size != newSize || len(np.Replaces) != 0 {
+			t.Fatalf("appended pack = {%q,%d,replaces=%v}, want {%q,%d,nil}",
+				np.ID, np.Size, np.Replaces, newID, newSize)
+		}
+	}
+}
+
+// assertBaseUnmutated pins nextPushManifest's isolation contract: scribbling the
+// result must not corrupt the caller's base manifest, which pushOnce keeps using
+// on a lost-CAS retry.
+func assertBaseUnmutated(t *testing.T, base *manifest.Manifest, gen uint64, repoID string, snapRefs map[string]string, wantOldIDs []string) {
+	t.Helper()
+	if base.Generation != gen || base.RepoID != repoID {
+		t.Fatalf("nextPushManifest mutated base meta")
+	}
+	if !maps.Equal(base.Refs, snapRefs) {
+		t.Fatalf("nextPushManifest leaked into base.Refs: %v", base.Refs)
+	}
+	baseIDs := make([]string, 0, len(base.Packs))
+	for _, p := range base.Packs {
+		baseIDs = append(baseIDs, p.ID)
+	}
+	if !slices.Equal(baseIDs, wantOldIDs) {
+		t.Fatalf("nextPushManifest mutated base packs: %v want %v", baseIDs, wantOldIDs)
+	}
+}
+
+// assertRepackResult pins repackManifest's construction contract: the generation
+// is bumped by exactly one, the pack set is the single merged pack (id/size
+// verbatim) carrying every prior pack id in order as Replaces, and
+// version/repo-id/head/refs carry forward unchanged.
+func assertRepackResult(t *testing.T, man *manifest.Manifest, gen uint64, newID string, newSize int64, wantOldIDs []string, repoID, head string, snapRefs map[string]string) {
+	t.Helper()
+	if man.Generation != gen+1 {
+		t.Fatalf("generation = %d, want %d", man.Generation, gen+1)
+	}
+	if len(man.Packs) != 1 {
+		t.Fatalf("got %d packs, want exactly 1", len(man.Packs))
+	}
+	if man.Packs[0].ID != newID || man.Packs[0].Size != newSize {
+		t.Fatalf("merged pack = {%q, %d}, want {%q, %d}",
+			man.Packs[0].ID, man.Packs[0].Size, newID, newSize)
+	}
+	if !slices.Equal(man.Packs[0].Replaces, wantOldIDs) {
+		t.Fatalf("Replaces = %v, want %v", man.Packs[0].Replaces, wantOldIDs)
+	}
+	if man.Version != manifest.Version {
+		t.Fatalf("version = %d, want %d", man.Version, manifest.Version)
+	}
+	if man.RepoID != repoID {
+		t.Fatalf("RepoID = %q, want %q (must survive a repack unchanged)", man.RepoID, repoID)
+	}
+	if man.Head != head {
+		t.Fatalf("Head = %q, want %q", man.Head, head)
+	}
+	if !maps.Equal(man.Refs, snapRefs) {
+		t.Fatalf("Refs = %v, want %v", man.Refs, snapRefs)
+	}
+}
+
+// assertCurUnmutated pins repackManifest's isolation contract: scribbling the
+// result must not corrupt cur's manifest, which repackOnce keeps using on a
+// lost-CAS retry.
+func assertCurUnmutated(t *testing.T, cur *RemoteState, gen uint64, repoID, head string, snapRefs map[string]string, wantOldIDs []string) {
+	t.Helper()
+	if cur.Manifest.Generation != gen {
+		t.Fatalf("repackManifest mutated cur generation: %d != %d", cur.Manifest.Generation, gen)
+	}
+	if cur.Manifest.RepoID != repoID || cur.Manifest.Head != head {
+		t.Fatalf("repackManifest mutated cur meta")
+	}
+	if !maps.Equal(cur.Manifest.Refs, snapRefs) {
+		t.Fatalf("repackManifest leaked into cur.Refs: %v", cur.Manifest.Refs)
+	}
+	curOldIDs := make([]string, 0, len(cur.Manifest.Packs))
+	for _, p := range cur.Manifest.Packs {
+		curOldIDs = append(curOldIDs, p.ID)
+	}
+	if !slices.Equal(curOldIDs, wantOldIDs) {
+		t.Fatalf("repackManifest mutated cur packs: %v want %v", curOldIDs, wantOldIDs)
+	}
+}
+
+// assertConsolidatedShape pins consolidatedPacks' shape: exactly the survivors
+// (verbatim, in order) followed by the one merged pack, whose id/size are
+// verbatim and whose Replaces is the victim list in order with no drop/dup/reorder.
+func assertConsolidatedShape(t *testing.T, got, wantSurvivors []manifest.Pack, mergedID string, mergedSize int64, victimIDs []string) {
+	t.Helper()
+	if len(got) != len(wantSurvivors)+1 {
+		t.Fatalf("got %d packs, want %d survivors + 1 merged", len(got), len(wantSurvivors))
+	}
+	for i := range wantSurvivors {
+		if !packFieldsEqual(got[i], wantSurvivors[i]) {
+			t.Fatalf("survivor %d = %+v, want %+v", i, got[i], wantSurvivors[i])
+		}
+	}
+	merged := got[len(got)-1]
+	if merged.ID != mergedID || merged.Size != mergedSize {
+		t.Fatalf("merged pack = {%q,%d}, want {%q,%d}", merged.ID, merged.Size, mergedID, mergedSize)
+	}
+	if !slices.Equal(merged.Replaces, victimIDs) {
+		t.Fatalf("merged Replaces = %v, want %v", merged.Replaces, victimIDs)
+	}
+}
+
+// assertConsolidationComplete pins the load-bearing consolidation harm statement:
+// every live pack is either retained as a survivor or declared superseded in the
+// merged pack's Replaces (a live pack that vanished unlisted would be lost to a
+// client that had not applied it -- it would never re-download it), and dually no
+// survivor is itself a victim.
+func assertConsolidationComplete(t *testing.T, got, packs []manifest.Pack, victimIDs []string) {
+	t.Helper()
+	survivors := got[:len(got)-1]
+	merged := got[len(got)-1]
+	for _, p := range packs {
+		retained := slices.ContainsFunc(survivors, func(s manifest.Pack) bool { return s.ID == p.ID })
+		if !retained && !slices.Contains(merged.Replaces, p.ID) {
+			t.Fatalf("live pack %q neither retained nor superseded in Replaces", p.ID)
+		}
+	}
+	for _, s := range survivors {
+		if slices.Contains(victimIDs, s.ID) {
+			t.Fatalf("victim pack %q survived the consolidation", s.ID)
+		}
+	}
+}
+
+// assertConsolidatedNoMutation pins that consolidatedPacks reads its inputs and
+// builds a fresh slice, mutating neither packs nor victimIDs (applyConsolidation
+// hands it the live plan.man.Packs).
+func assertConsolidatedNoMutation(t *testing.T, packs, packsSnap []manifest.Pack, victimIDs, victimSnap []string) {
+	t.Helper()
+	if len(packs) != len(packsSnap) {
+		t.Fatalf("packs slice length changed: %d != %d", len(packs), len(packsSnap))
+	}
+	for i := range packs {
+		if !packFieldsEqual(packs[i], packsSnap[i]) {
+			t.Fatalf("packs[%d] mutated", i)
+		}
+	}
+	if !slices.Equal(victimIDs, victimSnap) {
+		t.Fatalf("victimIDs mutated: %v want %v", victimIDs, victimSnap)
+	}
+}
+
+// assertCanMarkVerdict pins canMarkConsolidated's verdict: victimIDs are the
+// victim ids in order, and canMark holds IFF every victim is covered -- already
+// applied or the not-yet-pushed pack -- re-derived here as a union membership
+// test (a different shape than the implementation's per-victim flip). The
+// one-sided floor is the load-bearing harm statement: a canMark=true with a
+// never-applied, non-pushed victim would mark the merged pack applied while its
+// objects are absent locally, skipping a needed download forever.
+func assertCanMarkVerdict(t *testing.T, gotIDs []string, gotCanMark bool, victims []manifest.Pack, notYetPushedID string, applied map[string]bool) {
+	t.Helper()
+	wantIDs := make([]string, 0, len(victims))
+	for _, v := range victims {
+		wantIDs = append(wantIDs, v.ID)
+	}
+	if !slices.Equal(gotIDs, wantIDs) {
+		t.Fatalf("victimIDs = %v, want %v", gotIDs, wantIDs)
+	}
+
+	covered := maps.Clone(applied)
+	covered[notYetPushedID] = true
+	wantCanMark := true
+	for _, v := range victims {
+		if !covered[v.ID] {
+			wantCanMark = false
+			break
+		}
+	}
+	if gotCanMark != wantCanMark {
+		t.Fatalf("canMark = %v, want %v (victims=%v notYet=%q applied=%v)",
+			gotCanMark, wantCanMark, wantIDs, notYetPushedID, applied)
+	}
+
+	if gotCanMark {
+		for _, v := range victims {
+			if v.ID != notYetPushedID && !applied[v.ID] {
+				t.Fatalf("canMark=true but victim %q is neither the not-yet-pushed pack nor applied", v.ID)
+			}
+		}
+	}
+}
+
+// assertCanMarkNoMutation pins that canMarkConsolidated reads applied and victims
+// and builds a fresh slice, mutating neither. (manifest.Pack carries a slice
+// field so it is not comparable; compare the fields this target sets.)
+func assertCanMarkNoMutation(t *testing.T, victims, victimSnap []manifest.Pack, applied, appliedSnap map[string]bool) {
+	t.Helper()
+	if len(victims) != len(victimSnap) {
+		t.Fatalf("victims slice length changed: %d != %d", len(victims), len(victimSnap))
+	}
+	for i := range victims {
+		if victims[i].ID != victimSnap[i].ID || victims[i].Size != victimSnap[i].Size {
+			t.Fatalf("victims[%d] mutated", i)
+		}
+	}
+	if !maps.Equal(applied, appliedSnap) {
+		t.Fatalf("applied map mutated")
+	}
+}
+
+// assertDeletePlan pins planRefUpdates' delete authorization and projection: one
+// result per update in order (each reporting its own Dst), a delete accepted iff
+// its target is present in the ORIGINAL remote set (and then removed from the
+// projected ref set) else rejected with "remote ref does not exist", no pack want
+// from any delete, and the accepted count and projected ref set matching the
+// independently re-derived oracle.
+func assertDeletePlan(t *testing.T, results []RefResult, newRefs map[string]string, wants []string, accepted int, updates []RefUpdate, before map[string]string) {
+	t.Helper()
+	if len(results) != len(updates) {
+		t.Fatalf("got %d results, want %d", len(results), len(updates))
+	}
+
+	wantAccepted := 0
+	wantNew := maps.Clone(before)
+	for i, u := range updates {
+		_, present := before[u.Dst]
+		if results[i].Dst != u.Dst {
+			t.Fatalf("results[%d].Dst = %q, want %q", i, results[i].Dst, u.Dst)
+		}
+		if present {
+			wantAccepted++
+			delete(wantNew, u.Dst)
+			if results[i].Err != "" {
+				t.Fatalf("accepted delete of %q reported Err %q, want empty", u.Dst, results[i].Err)
+			}
+		} else if results[i].Err != "remote ref does not exist" {
+			t.Fatalf("rejected delete of %q reported Err %q, want %q",
+				u.Dst, results[i].Err, "remote ref does not exist")
+		}
+	}
+
+	if accepted != wantAccepted {
+		t.Fatalf("accepted = %d, want %d", accepted, wantAccepted)
+	}
+	if len(wants) != 0 {
+		t.Fatalf("deletes produced %d pack wants, want 0: %v", len(wants), wants)
+	}
+	if !maps.Equal(newRefs, wantNew) {
+		t.Fatalf("newRefs = %v, want %v", newRefs, wantNew)
+	}
+}
+
+// assertSkippableSafety pins packSkippable's composition and one-sided safety: the
+// gate is exactly "covered OR local closure complete"; a skip while the closure is
+// NOT complete is justified only by full replaces cover (every superseded pack
+// applied); and a pack with no predecessors is never covered, so its gate reduces
+// to the closure verdict alone.
+func assertSkippableSafety(t *testing.T, got, covered, closureResult bool, replaces []string, appliedSet map[string]bool) {
+	t.Helper()
+	if want := covered || closureResult; got != want {
+		t.Fatalf("packSkippable = %v, want %v (covered=%v closure=%v)",
+			got, want, covered, closureResult)
+	}
+	if got && !closureResult {
+		if len(replaces) == 0 {
+			t.Fatalf("skipped a pack with no predecessors and no local closure")
+		}
+		for _, r := range replaces {
+			if !appliedSet[r] {
+				t.Fatalf("skipped a pack while predecessor %q is not applied", r)
+			}
+		}
+	}
+	if len(replaces) == 0 {
+		if covered {
+			t.Fatalf("replacesCovered = true for a pack with no predecessors")
+		}
+		if got != closureResult {
+			t.Fatalf("empty-replaces gate = %v, want closure %v", got, closureResult)
+		}
+	}
+}
+
+// assertSkippableMonotonic pins packSkippable's monotonicity toward full cover:
+// marking EVERY predecessor applied can only make a non-empty pack covered, never
+// un-cover one already covered.
+func assertSkippableMonotonic(t *testing.T, p manifest.Pack, replaces []string, covered bool) {
+	t.Helper()
+	full := map[string]bool{}
+	for _, r := range replaces {
+		full[r] = true
+	}
+	fullCovered := replacesCovered(p, full)
+	if fullCovered != (len(replaces) > 0) {
+		t.Fatalf("replacesCovered with all applied = %v, want %v", fullCovered, len(replaces) > 0)
+	}
+	if covered && !fullCovered {
+		t.Fatalf("covered under a subset but not under the full applied set")
+	}
+}
+
+// assertSelectHeadSafety pins selectManifestHead's membership and provenance: a
+// non-empty head is always a ref the manifest carries (the dangling-HEAD guard),
+// and the result is only ever one of its two candidate inputs or empty.
+func assertSelectHeadSafety(t *testing.T, got, local, prevHead string, hasPrev bool, refs map[string]string) {
+	t.Helper()
+	if got != "" {
+		if _, ok := refs[got]; !ok {
+			t.Fatalf("selectManifestHead = %q, which is not in the ref set %v", got, refs)
+		}
+	}
+	if got != "" && got != local && !(hasPrev && got == prevHead) {
+		t.Fatalf("selectManifestHead = %q, neither local %q nor prev head %q", got, local, prevHead)
+	}
+}
+
+// assertSelectHeadCascade pins selectManifestHead's priority cascade: the local
+// HEAD branch wins outright (even when prev is also usable), else the prev head is
+// the fallback, else there is no head; and emptiness holds iff no candidate is
+// usable.
+func assertSelectHeadCascade(t *testing.T, got, local, prevHead string, localUsable, prevUsable bool) {
+	t.Helper()
+	switch {
+	case localUsable:
+		if got != local {
+			t.Fatalf("local %q is usable but selectManifestHead = %q", local, got)
+		}
+	case prevUsable:
+		if got != prevHead {
+			t.Fatalf("local unusable and prev %q usable but selectManifestHead = %q", prevHead, got)
+		}
+	default:
+		if got != "" {
+			t.Fatalf("no usable candidate but selectManifestHead = %q", got)
+		}
+	}
+	if (got == "") == (localUsable || prevUsable) {
+		t.Fatalf("got = %q but localUsable=%v prevUsable=%v", got, localUsable, prevUsable)
+	}
 }

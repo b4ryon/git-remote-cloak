@@ -62,6 +62,81 @@ func expectedTreeName(name string) string {
 	return name
 }
 
+// enablePrecompose turns on git's macOS NFD->NFC precomposition explicitly
+// (git init usually sets it on darwin) so the round trip is deterministic
+// across git builds.
+func enablePrecompose(t *testing.T, g *gitx.G, machines ...*machine) {
+	t.Helper()
+	for _, m := range machines {
+		if _, _, err := g.Run(gitx.Opts{GitDir: m.gitDir}, "config", "core.precomposeunicode", "true"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// writeTrickyFiles writes every name->content pair into dir.
+func writeTrickyFiles(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatalf("create %q: %v", name, err)
+		}
+	}
+}
+
+// assertTreeNames checks that the tree at oid on b holds exactly the expected
+// (post-precompose) names from files and nothing else.
+func assertTreeNames(t *testing.T, b *machine, oid string, files map[string]string) {
+	t.Helper()
+	out, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir}, "ls-tree", "-r", "--name-only", "-z", oid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, n := range strings.Split(out, "\x00") {
+		if n != "" {
+			got = append(got, n)
+		}
+	}
+	var want []string
+	for name := range files {
+		want = append(want, expectedTreeName(name))
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if len(got) != len(want) {
+		t.Fatalf("tree has %d entries, want %d:\ngot  %q\nwant %q", len(got), len(want), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tree entry %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// assertCheckoutContents materializes oid on b's worktree and verifies every
+// file lands readable on disk with the expected content.
+func assertCheckoutContents(t *testing.T, g *gitx.G, b *machine, oid string, files map[string]string) {
+	t.Helper()
+	if _, _, err := g.Run(gitx.Opts{GitDir: b.gitDir}, "update-ref", "refs/heads/main", oid); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := g.Run(gitx.Opts{Dir: b.dir, Scrub: true}, "checkout", "-f", "main"); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range files {
+		onDisk := expectedTreeName(name)
+		gotContent, err := os.ReadFile(filepath.Join(b.dir, onDisk))
+		if err != nil {
+			t.Errorf("checkout missing %q: %v", onDisk, err)
+			continue
+		}
+		if string(gotContent) != content {
+			t.Errorf("%q content = %q, want %q", onDisk, gotContent, content)
+		}
+	}
+}
+
 func TestEngineFilenameRoundTrip(t *testing.T) {
 	g := gitx.New(discard())
 	host := newHostRepo(t, g)
@@ -74,20 +149,10 @@ func TestEngineFilenameRoundTrip(t *testing.T) {
 	}
 	a := newMachine(t, g, host, key)
 	b := newMachine(t, g, host, key)
-	for _, m := range []*machine{a, b} {
-		// Deterministic across git builds: enable the macOS NFD->NFC
-		// precomposition explicitly (git init usually sets it on darwin).
-		if _, _, err := g.Run(gitx.Opts{GitDir: m.gitDir}, "config", "core.precomposeunicode", "true"); err != nil {
-			t.Fatal(err)
-		}
-	}
+	enablePrecompose(t, g, a, b)
 
 	files := trickyFiles()
-	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(a.dir, name), []byte(content), 0o600); err != nil {
-			t.Fatalf("create %q: %v", name, err)
-		}
-	}
+	writeTrickyFiles(t, a.dir, files)
 	if _, _, err := g.Run(gitx.Opts{Dir: a.dir, Scrub: true}, "add", "-A"); err != nil {
 		t.Fatal(err)
 	}
@@ -113,49 +178,9 @@ func TestEngineFilenameRoundTrip(t *testing.T) {
 	}
 
 	// The tree on B must hold exactly the expected (post-precompose) names.
-	out, _, err2 := b.g.Run(gitx.Opts{GitDir: b.gitDir}, "ls-tree", "-r", "--name-only", "-z", oid)
-	if err2 != nil {
-		t.Fatal(err2)
-	}
-	var got []string
-	for _, n := range strings.Split(out, "\x00") {
-		if n != "" {
-			got = append(got, n)
-		}
-	}
-	var want []string
-	for name := range files {
-		want = append(want, expectedTreeName(name))
-	}
-	sort.Strings(got)
-	sort.Strings(want)
-	if len(got) != len(want) {
-		t.Fatalf("tree has %d entries, want %d:\ngot  %q\nwant %q", len(got), len(want), got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("tree entry %d = %q, want %q", i, got[i], want[i])
-		}
-	}
-
+	assertTreeNames(t, b, oid, files)
 	// Materialize on B and verify contents land readable on disk.
-	if _, _, err := g.Run(gitx.Opts{GitDir: b.gitDir}, "update-ref", "refs/heads/main", oid); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := g.Run(gitx.Opts{Dir: b.dir, Scrub: true}, "checkout", "-f", "main"); err != nil {
-		t.Fatal(err)
-	}
-	for name, content := range files {
-		onDisk := expectedTreeName(name)
-		gotContent, err := os.ReadFile(filepath.Join(b.dir, onDisk))
-		if err != nil {
-			t.Errorf("checkout missing %q: %v", onDisk, err)
-			continue
-		}
-		if string(gotContent) != content {
-			t.Errorf("%q content = %q, want %q", onDisk, gotContent, content)
-		}
-	}
+	assertCheckoutContents(t, g, b, oid, files)
 }
 
 // TestEngineUnicodeRefRoundTrip pins that non-ASCII branch names pass the

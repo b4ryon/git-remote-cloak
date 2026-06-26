@@ -258,53 +258,11 @@ func FuzzClassifyExit(f *testing.F) {
 			t.Fatalf("classifyExit with non-nil runErr returned nil (args=%q exit=%d)", argStr, exit)
 		}
 
-		var te *TimeoutError
-		var ce *CanceledError
-		var ge *GitError
-		switch {
-		case ctxErr == context.DeadlineExceeded:
-			// (2) A deadline wins over the exit code. Even with a non -1 exit
-			// and stderr that a classify regex would otherwise match, the result
-			// is a *TimeoutError (never a *GitError), carrying the elapsed time.
-			if !errors.As(got, &te) {
-				t.Fatalf("deadline: got %T, want *TimeoutError", got)
-			}
-			if errors.As(got, &ge) {
-				t.Fatalf("deadline produced a *GitError; a stall's stderr must never reach the classify table")
-			}
-			if te.Elapsed != dur {
-				t.Fatalf("TimeoutError.Elapsed = %v, want %v", te.Elapsed, dur)
-			}
-		case ctxErr == context.Canceled:
-			// (3) A cancel wins over the exit code, same rationale.
-			if !errors.As(got, &ce) {
-				t.Fatalf("cancel: got %T, want *CanceledError", got)
-			}
-			if errors.As(got, &ge) {
-				t.Fatalf("cancel produced a *GitError")
-			}
-		case exit == -1:
-			// (4) No deadline/cancel and a non-exit failure (spawn error, killed
-			// by an external signal): a generic wrapped error that wraps runErr
-			// and is none of the typed transport errors, so ClassifyTransport
-			// defaults it to the conservative LocalGit.
-			if errors.As(got, &te) || errors.As(got, &ce) || errors.As(got, &ge) {
-				t.Fatalf("exit -1 produced a typed transport error: %T", got)
-			}
-			if !errors.Is(got, runErr) {
-				t.Fatalf("exit -1 result does not wrap runErr: %v", got)
-			}
-		default:
-			// (5) A real non-zero git exit: a *GitError carrying the exit code
-			// and stderr verbatim - the only shape whose stderr the classify
-			// table is allowed to read.
-			if !errors.As(got, &ge) {
-				t.Fatalf("non-zero exit: got %T, want *GitError", got)
-			}
-			if ge.ExitCode != exit || ge.Stderr != stderr {
-				t.Fatalf("GitError = {exit %d, stderr %q}, want {exit %d, stderr %q}", ge.ExitCode, ge.Stderr, exit, stderr)
-			}
-		}
+		// (2)-(5) The typed-error precedence contract (deadline/cancel win over
+		// the exit code; exit -1 is a generic wrapped error; a real non-zero exit
+		// is a *GitError). Extracted to keep this fuzz body under the complexity
+		// budget; see assertExitErrorType for the per-branch rationale.
+		assertExitErrorType(t, got, ctxErr, runErr, exit, dur, stderr)
 
 		// (6) End-to-end security property: a deadline/cancel ALWAYS classifies
 		// as Network downstream - never a stderr-derived kind - regardless of
@@ -324,6 +282,88 @@ func FuzzClassifyExit(f *testing.F) {
 			t.Fatalf("classifyExit nondeterministic: %T then %T", got, again)
 		}
 	})
+}
+
+// assertExitErrorType verifies classifyExit's typed-error precedence for a
+// non-nil runErr: a deadline/cancel wins over the process exit code (yielding a
+// *TimeoutError/*CanceledError, never a *GitError whose stderr the classify
+// table could read), a non-exit failure (exit -1) is a generic error that wraps
+// runErr, and a real non-zero git exit is a *GitError carrying the exit code and
+// stderr verbatim. It dispatches to assertStallNotTamper / assertExitCodeError;
+// the split keeps each helper (and FuzzClassifyExit) under the complexity budget
+// without changing any assertion.
+func assertExitErrorType(t *testing.T, got error, ctxErr, runErr error, exit int, dur time.Duration, stderr string) {
+	t.Helper()
+	if ctxErr == context.DeadlineExceeded || ctxErr == context.Canceled {
+		assertStallNotTamper(t, got, ctxErr, dur)
+		return
+	}
+	assertExitCodeError(t, got, runErr, exit, stderr)
+}
+
+// assertStallNotTamper verifies the deadline/cancel branch of classifyExit: a
+// stall (DeadlineExceeded) or cancel wins over the exit code, surfacing a
+// *TimeoutError/*CanceledError and NEVER a *GitError whose stderr the classify
+// table could read - the load-bearing "a stall is never tamper" guarantee.
+func assertStallNotTamper(t *testing.T, got error, ctxErr error, dur time.Duration) {
+	t.Helper()
+	var te *TimeoutError
+	var ce *CanceledError
+	var ge *GitError
+	if ctxErr == context.DeadlineExceeded {
+		// (2) A deadline wins over the exit code. Even with a non -1 exit
+		// and stderr that a classify regex would otherwise match, the result
+		// is a *TimeoutError (never a *GitError), carrying the elapsed time.
+		if !errors.As(got, &te) {
+			t.Fatalf("deadline: got %T, want *TimeoutError", got)
+		}
+		if errors.As(got, &ge) {
+			t.Fatalf("deadline produced a *GitError; a stall's stderr must never reach the classify table")
+		}
+		if te.Elapsed != dur {
+			t.Fatalf("TimeoutError.Elapsed = %v, want %v", te.Elapsed, dur)
+		}
+		return
+	}
+	// (3) A cancel wins over the exit code, same rationale.
+	if !errors.As(got, &ce) {
+		t.Fatalf("cancel: got %T, want *CanceledError", got)
+	}
+	if errors.As(got, &ge) {
+		t.Fatalf("cancel produced a *GitError")
+	}
+}
+
+// assertExitCodeError verifies the no-deadline/no-cancel branch of classifyExit:
+// a non-exit failure (exit -1, e.g. spawn error or external signal) is a generic
+// wrapped error that is none of the typed transport errors, while a real
+// non-zero git exit is a *GitError carrying the exit code and stderr verbatim -
+// the only shape whose stderr the classify table is allowed to read.
+func assertExitCodeError(t *testing.T, got error, runErr error, exit int, stderr string) {
+	t.Helper()
+	var te *TimeoutError
+	var ce *CanceledError
+	var ge *GitError
+	if exit == -1 {
+		// (4) No deadline/cancel and a non-exit failure: a generic wrapped
+		// error that wraps runErr and is none of the typed transport errors,
+		// so ClassifyTransport defaults it to the conservative LocalGit.
+		if errors.As(got, &te) || errors.As(got, &ce) || errors.As(got, &ge) {
+			t.Fatalf("exit -1 produced a typed transport error: %T", got)
+		}
+		if !errors.Is(got, runErr) {
+			t.Fatalf("exit -1 result does not wrap runErr: %v", got)
+		}
+		return
+	}
+	// (5) A real non-zero git exit: a *GitError carrying the exit code and
+	// stderr verbatim - the only shape whose stderr the classify table reads.
+	if !errors.As(got, &ge) {
+		t.Fatalf("non-zero exit: got %T, want *GitError", got)
+	}
+	if ge.ExitCode != exit || ge.Stderr != stderr {
+		t.Fatalf("GitError = {exit %d, stderr %q}, want {exit %d, stderr %q}", ge.ExitCode, ge.Stderr, exit, stderr)
+	}
 }
 
 // classifyKind runs ClassifyTransport over a stderr string and returns its
@@ -400,58 +440,72 @@ func FuzzApplyGitEnv(f *testing.F) {
 
 		got := applyGitEnv(parent, o)
 
-		// (1) GIT_DIR isolation - the load-bearing security harm statement. The
-		// only GIT_DIR= entries permitted in the child environment are the ones
-		// cloak sets deliberately: o.GitDir (when non-empty, added first) followed
-		// by any GIT_DIR= entry the caller put in o.Env. A GIT_DIR inherited from
-		// the parent environment must NEVER survive, or it would silently point
-		// the git subprocess at the wrong object store. Derived purely from
-		// o.GitDir/o.Env (never the parent), so a dropped drop is caught.
-		var wantGitDirs []string
-		if gitDir != "" {
-			wantGitDirs = append(wantGitDirs, "GIT_DIR="+gitDir)
-		}
-		wantGitDirs = append(wantGitDirs, gitDirLines(extra)...)
-		if g := gitDirLines(got); !slices.Equal(g, wantGitDirs) {
-			t.Fatalf("GIT_DIR entries = %q, want %q (a parent GIT_DIR must never survive)\nparent: %q\ngitDir: %q\nenv: %q",
-				g, wantGitDirs, parent, gitDir, extra)
-		}
-
-		// (2) Preservation + ordering (a different decomposition than the build
-		// loop): every NON-GIT_DIR parent entry is kept verbatim and in order at
-		// the front of the result - cloak strips only the inherited GIT_DIR, never
-		// drops or rewrites other inherited config (transport config like
-		// core.sshCommand must keep working).
-		var kept []string
-		for _, kv := range parent {
-			if !strings.HasPrefix(kv, "GIT_DIR=") {
-				kept = append(kept, kv)
-			}
-		}
-		if len(got) < len(kept) || !slices.Equal(got[:len(kept)], kept) {
-			t.Fatalf("non-GIT_DIR parent entries not preserved as the leading segment\nparent: %q\ngot: %q", parent, got)
-		}
-
-		// (3) o.Env is appended verbatim as the trailing segment - the caller's
-		// explicit environment wins and is never reordered or dropped.
-		if len(extra) > 0 {
-			if len(got) < len(extra) || !slices.Equal(got[len(got)-len(extra):], extra) {
-				t.Fatalf("o.Env not preserved verbatim as the trailing segment\nenv: %q\ngot: %q", extra, got)
-			}
-		}
-
-		// (4) Scrub harm statement (one-sided): when set, both config-disabling
-		// vars must be present so the user's system/global git config cannot
-		// interfere with backend object building.
-		if scrub {
-			if !slices.Contains(got, "GIT_CONFIG_NOSYSTEM=1") || !slices.Contains(got, "GIT_CONFIG_GLOBAL=/dev/null") {
-				t.Fatalf("scrub did not disable system/global git config\ngot: %q", got)
-			}
-		}
-
-		// (5) Determinism: applyGitEnv is a pure function of (parent, o).
-		if again := applyGitEnv(parent, o); !slices.Equal(again, got) {
-			t.Fatalf("applyGitEnv nondeterministic:\nonce:  %q\ntwice: %q", got, again)
-		}
+		assertAppliedGitEnv(t, got, parent, o)
 	})
+}
+
+// assertAppliedGitEnv verifies the full applyGitEnv contract for one (parent, o)
+// pair: GIT_DIR isolation (only cloak's deliberate o.GitDir/o.Env entries
+// survive, never an inherited parent GIT_DIR), verbatim preservation and
+// ordering of the non-GIT_DIR parent segment, the o.Env trailing segment, the
+// scrub config-disable vars, and determinism. Extracted from FuzzApplyGitEnv to
+// keep that fuzz body under the cyclomatic-complexity budget; every assertion is
+// unchanged.
+func assertAppliedGitEnv(t *testing.T, got, parent []string, o Opts) {
+	t.Helper()
+	gitDir, extra, scrub := o.GitDir, o.Env, o.Scrub
+
+	// (1) GIT_DIR isolation - the load-bearing security harm statement. The
+	// only GIT_DIR= entries permitted in the child environment are the ones
+	// cloak sets deliberately: o.GitDir (when non-empty, added first) followed
+	// by any GIT_DIR= entry the caller put in o.Env. A GIT_DIR inherited from
+	// the parent environment must NEVER survive, or it would silently point
+	// the git subprocess at the wrong object store. Derived purely from
+	// o.GitDir/o.Env (never the parent), so a dropped drop is caught.
+	var wantGitDirs []string
+	if gitDir != "" {
+		wantGitDirs = append(wantGitDirs, "GIT_DIR="+gitDir)
+	}
+	wantGitDirs = append(wantGitDirs, gitDirLines(extra)...)
+	if g := gitDirLines(got); !slices.Equal(g, wantGitDirs) {
+		t.Fatalf("GIT_DIR entries = %q, want %q (a parent GIT_DIR must never survive)\nparent: %q\ngitDir: %q\nenv: %q",
+			g, wantGitDirs, parent, gitDir, extra)
+	}
+
+	// (2) Preservation + ordering (a different decomposition than the build
+	// loop): every NON-GIT_DIR parent entry is kept verbatim and in order at
+	// the front of the result - cloak strips only the inherited GIT_DIR, never
+	// drops or rewrites other inherited config (transport config like
+	// core.sshCommand must keep working).
+	var kept []string
+	for _, kv := range parent {
+		if !strings.HasPrefix(kv, "GIT_DIR=") {
+			kept = append(kept, kv)
+		}
+	}
+	if len(got) < len(kept) || !slices.Equal(got[:len(kept)], kept) {
+		t.Fatalf("non-GIT_DIR parent entries not preserved as the leading segment\nparent: %q\ngot: %q", parent, got)
+	}
+
+	// (3) o.Env is appended verbatim as the trailing segment - the caller's
+	// explicit environment wins and is never reordered or dropped.
+	if len(extra) > 0 {
+		if len(got) < len(extra) || !slices.Equal(got[len(got)-len(extra):], extra) {
+			t.Fatalf("o.Env not preserved verbatim as the trailing segment\nenv: %q\ngot: %q", extra, got)
+		}
+	}
+
+	// (4) Scrub harm statement (one-sided): when set, both config-disabling
+	// vars must be present so the user's system/global git config cannot
+	// interfere with backend object building.
+	if scrub {
+		if !slices.Contains(got, "GIT_CONFIG_NOSYSTEM=1") || !slices.Contains(got, "GIT_CONFIG_GLOBAL=/dev/null") {
+			t.Fatalf("scrub did not disable system/global git config\ngot: %q", got)
+		}
+	}
+
+	// (5) Determinism: applyGitEnv is a pure function of (parent, o).
+	if again := applyGitEnv(parent, o); !slices.Equal(again, got) {
+		t.Fatalf("applyGitEnv nondeterministic:\nonce:  %q\ntwice: %q", got, again)
+	}
 }

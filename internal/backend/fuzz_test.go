@@ -495,62 +495,78 @@ func FuzzPushArgs(f *testing.F) {
 	f.Fuzz(func(t *testing.T, branch, commit, lease string) {
 		args := pushArgs(branch, commit, lease)
 
-		// (1) Command skeleton: `push --porcelain [<lease>] origin <refspec>`.
-		// Exactly 4 args without a lease, 5 with one -- no extra or dropped arg
-		// (a dropped --porcelain would break push()'s result parsing).
-		wantLen := 4
-		if lease != "" {
-			wantLen = 5
-		}
-		if len(args) != wantLen {
-			t.Fatalf("len(args) = %d, want %d: %v", len(args), wantLen, args)
-		}
-		if args[0] != "push" || args[1] != "--porcelain" {
-			t.Fatalf("argv does not start with `push --porcelain`: %v", args)
-		}
-		if args[len(args)-2] != "origin" {
-			t.Fatalf("remote is not `origin`: %v", args)
-		}
-		if refspec := commit + ":refs/heads/" + branch; args[len(args)-1] != refspec {
-			t.Fatalf("refspec = %q, want %q", args[len(args)-1], refspec)
-		}
-
-		// (2) Headline security invariant: no arg is ever a plain/unguarded force
-		// flag, for ANY input. This holds universally -- every arg is a fixed
-		// token, the "--force-with-lease=refs/heads/...:..." form, or a positional
-		// that always carries ":refs/heads/" (the refspec) -- so none can equal a
-		// bare force flag. It is the documented "a plain --force is structurally
-		// impossible" contract stated as a forbidden-value property.
-		for _, a := range args {
-			switch a {
-			case "--force", "-f", "--force-with-lease", "--force-if-includes":
-				t.Fatalf("plain/unguarded force flag %q in argv: %v", a, args)
-			}
-		}
-
-		// (3) A force flag is present IFF a lease was requested, and when present
-		// it is exactly the --force-with-lease form carrying refs/heads/<branch>
-		// and the caller's explicit expected value <lease> -- never a remembered
-		// or empty value that would weaken the compare-and-swap. Scanning only the
-		// flags region keeps an adversarial refspec from being read as a flag.
-		forceFlags := 0
-		for _, a := range args[1 : len(args)-2] {
-			if strings.HasPrefix(a, "--force") {
-				forceFlags++
-				if want := "--force-with-lease=refs/heads/" + branch + ":" + lease; a != want {
-					t.Fatalf("force flag = %q, want explicit lease %q", a, want)
-				}
-			}
-		}
-		if hasForce := forceFlags > 0; hasForce != (lease != "") {
-			t.Fatalf("force present = %v, want %v (lease=%q)", hasForce, lease != "", lease)
-		}
+		assertPushSkeleton(t, args, branch, commit, lease)
+		assertNoBareForceFlag(t, args)
+		assertLeaseForce(t, args, branch, lease)
 
 		// (4) Pure function: identical inputs yield an identical argv.
 		if again := pushArgs(branch, commit, lease); !slices.Equal(again, args) {
 			t.Fatalf("non-deterministic argv: %v then %v", args, again)
 		}
 	})
+}
+
+// assertPushSkeleton pins pushArgs's command skeleton:
+// `push --porcelain [<lease>] origin <refspec>`. Exactly 4 args without a lease,
+// 5 with one -- no extra or dropped arg (a dropped --porcelain would break
+// push()'s result parsing) -- with origin as the remote and the exact
+// <commit>:refs/heads/<branch> refspec.
+func assertPushSkeleton(t *testing.T, args []string, branch, commit, lease string) {
+	t.Helper()
+	wantLen := 4
+	if lease != "" {
+		wantLen = 5
+	}
+	if len(args) != wantLen {
+		t.Fatalf("len(args) = %d, want %d: %v", len(args), wantLen, args)
+	}
+	if args[0] != "push" || args[1] != "--porcelain" {
+		t.Fatalf("argv does not start with `push --porcelain`: %v", args)
+	}
+	if args[len(args)-2] != "origin" {
+		t.Fatalf("remote is not `origin`: %v", args)
+	}
+	if refspec := commit + ":refs/heads/" + branch; args[len(args)-1] != refspec {
+		t.Fatalf("refspec = %q, want %q", args[len(args)-1], refspec)
+	}
+}
+
+// assertNoBareForceFlag pins pushArgs's headline security invariant: no arg is
+// ever a plain/unguarded force flag, for ANY input. Every arg is a fixed token,
+// the "--force-with-lease=refs/heads/...:..." form, or a positional that always
+// carries ":refs/heads/" (the refspec) -- so none can equal a bare force flag.
+// It is the documented "a plain --force is structurally impossible" contract
+// stated as a forbidden-value property.
+func assertNoBareForceFlag(t *testing.T, args []string) {
+	t.Helper()
+	for _, a := range args {
+		switch a {
+		case "--force", "-f", "--force-with-lease", "--force-if-includes":
+			t.Fatalf("plain/unguarded force flag %q in argv: %v", a, args)
+		}
+	}
+}
+
+// assertLeaseForce pins that a force flag is present IFF a lease was requested,
+// and when present it is exactly the --force-with-lease form carrying
+// refs/heads/<branch> and the caller's explicit expected value <lease> -- never
+// a remembered or empty value that would weaken the compare-and-swap. Only the
+// flags region args[1:len-2] is scanned, so an adversarial refspec positional is
+// never read as a flag.
+func assertLeaseForce(t *testing.T, args []string, branch, lease string) {
+	t.Helper()
+	forceFlags := 0
+	for _, a := range args[1 : len(args)-2] {
+		if strings.HasPrefix(a, "--force") {
+			forceFlags++
+			if want := "--force-with-lease=refs/heads/" + branch + ":" + lease; a != want {
+				t.Fatalf("force flag = %q, want explicit lease %q", a, want)
+			}
+		}
+	}
+	if hasForce := forceFlags > 0; hasForce != (lease != "") {
+		t.Fatalf("force present = %v, want %v (lease=%q)", hasForce, lease != "", lease)
+	}
 }
 
 // FuzzClassifyPushResult pins classifyPushResult, which maps a backend push's
@@ -590,26 +606,7 @@ func FuzzClassifyPushResult(f *testing.F) {
 
 		res, marker := classifyPushResult(stdout, stderr, runErr)
 
-		// (1) Full-contract forward re-derivation: a nil run error short-circuits
-		// to PushOK before any scan; otherwise the FIRST documented marker present
-		// in the lowercased combined output (stdout, newline, stderr) wins as
-		// PushCASLost, else PushFailed.
-		wantRes, wantMarker := PushFailed, ""
-		if runErr == nil {
-			wantRes, wantMarker = PushOK, ""
-		} else {
-			combined := strings.ToLower(stdout + "\n" + stderr)
-			for _, m := range wantMarkers {
-				if strings.Contains(combined, m) {
-					wantRes, wantMarker = PushCASLost, m
-					break
-				}
-			}
-		}
-		if res != wantRes || marker != wantMarker {
-			t.Fatalf("classifyPushResult(%q, %q, err=%v) = (%v, %q), want (%v, %q)",
-				stdout, stderr, hasErr, res, marker, wantRes, wantMarker)
-		}
+		assertPushResultOracle(t, stdout, stderr, runErr, res, marker, wantMarkers)
 
 		// (2) Load-bearing safety, asserted independently of the marker set:
 		// PushOK IFF git reported no error. The engine commits/persists a push
@@ -620,31 +617,60 @@ func FuzzClassifyPushResult(f *testing.F) {
 				res == PushOK, runErr == nil)
 		}
 
-		// (3) The result is always one of the three defined outcomes, and a marker
-		// is set exactly when the result is PushCASLost. When set it is a real
-		// documented marker actually present in the lowercased output -- never
-		// fabricated, since the caller logs it as the observed signal.
-		switch res {
-		case PushOK, PushFailed:
-			if marker != "" {
-				t.Fatalf("res %v carries marker %q, want empty", res, marker)
-			}
-		case PushCASLost:
-			if !slices.Contains(wantMarkers, marker) {
-				t.Fatalf("PushCASLost marker %q is not a documented marker", marker)
-			}
-			if !strings.Contains(strings.ToLower(stdout+"\n"+stderr), marker) {
-				t.Fatalf("PushCASLost marker %q not present in the output", marker)
-			}
-		default:
-			t.Fatalf("undefined PushResult %v", res)
-		}
+		assertPushResultShape(t, res, marker, stdout, stderr, wantMarkers)
 
 		// (4) Pure function: identical inputs yield an identical classification.
 		if res2, marker2 := classifyPushResult(stdout, stderr, runErr); res2 != res || marker2 != marker {
 			t.Fatalf("non-deterministic: (%v, %q) then (%v, %q)", res, marker, res2, marker2)
 		}
 	})
+}
+
+// assertPushResultOracle is classifyPushResult's full-contract forward
+// re-derivation: a nil run error short-circuits to PushOK before any scan;
+// otherwise the FIRST documented marker present in the lowercased combined output
+// (stdout, newline, stderr) wins as PushCASLost, else PushFailed.
+func assertPushResultOracle(t *testing.T, stdout, stderr string, runErr error, res PushResult, marker string, wantMarkers []string) {
+	t.Helper()
+	wantRes, wantMarker := PushFailed, ""
+	if runErr == nil {
+		wantRes, wantMarker = PushOK, ""
+	} else {
+		combined := strings.ToLower(stdout + "\n" + stderr)
+		for _, m := range wantMarkers {
+			if strings.Contains(combined, m) {
+				wantRes, wantMarker = PushCASLost, m
+				break
+			}
+		}
+	}
+	if res != wantRes || marker != wantMarker {
+		t.Fatalf("classifyPushResult(%q, %q, err=%v) = (%v, %q), want (%v, %q)",
+			stdout, stderr, runErr != nil, res, marker, wantRes, wantMarker)
+	}
+}
+
+// assertPushResultShape pins that the result is always one of the three defined
+// outcomes, and a marker is set exactly when the result is PushCASLost. When set
+// it is a real documented marker actually present in the lowercased output --
+// never fabricated, since the caller logs it as the observed signal.
+func assertPushResultShape(t *testing.T, res PushResult, marker, stdout, stderr string, wantMarkers []string) {
+	t.Helper()
+	switch res {
+	case PushOK, PushFailed:
+		if marker != "" {
+			t.Fatalf("res %v carries marker %q, want empty", res, marker)
+		}
+	case PushCASLost:
+		if !slices.Contains(wantMarkers, marker) {
+			t.Fatalf("PushCASLost marker %q is not a documented marker", marker)
+		}
+		if !strings.Contains(strings.ToLower(stdout+"\n"+stderr), marker) {
+			t.Fatalf("PushCASLost marker %q not present in the output", marker)
+		}
+	default:
+		t.Fatalf("undefined PushResult %v", res)
+	}
 }
 
 // FuzzPackTreeText pins packTreeText, the write-side inverse of parsePackBlobTree.
@@ -680,17 +706,7 @@ func FuzzPackTreeText(f *testing.F) {
 	f.Add("emptyoid \nb cccc") // empty oid (unclean)
 
 	f.Fuzz(func(t *testing.T, raw string) {
-		// Build a packs map from fuzzed "<id> <oid>" lines (first space splits, so
-		// an id may carry later spaces). Duplicate ids take the last line's oid,
-		// exactly as a map assignment would.
-		packs := map[string]string{}
-		for _, line := range strings.Split(raw, "\n") {
-			id, oid, found := strings.Cut(line, " ")
-			if !found {
-				continue
-			}
-			packs[id] = oid
-		}
+		packs := buildPacksFromRaw(raw)
 
 		got := packTreeText(packs)
 
@@ -716,39 +732,73 @@ func FuzzPackTreeText(f *testing.F) {
 		// serialized lines -- exactly the shape the parser is allowed to drop -- so
 		// it is out of scope for a faithful round trip, just as in
 		// FuzzParsePackBlobTree.
-		for id, oid := range packs {
-			if strings.ContainsAny(id, "\t\n") || oid == "" || strings.ContainsFunc(oid, unicode.IsSpace) {
-				return
-			}
+		if !packsAreClean(packs) {
+			return
 		}
 
-		// Each clean entry is exactly one line "100644 blob <oid>\t<id>.age", and
-		// the ids appear in ascending order -- the reproducible-tree-identity
-		// contract that only the real serializer's sort provides (and that the
-		// parse-side fuzzer never exercises).
-		if n := strings.Count(got, "\n"); n != len(packs) {
-			t.Fatalf("emitted %d lines for %d packs", n, len(packs))
-		}
-		var ids []string
-		for _, e := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-			meta, name, ok := strings.Cut(e, "\t")
-			if !ok || !strings.HasSuffix(name, ".age") {
-				t.Fatalf("entry %q is not <meta>\\t<id>.age", e)
-			}
-			id := strings.TrimSuffix(name, ".age")
-			if want := "100644 blob " + packs[id]; meta != want {
-				t.Fatalf("entry meta %q, want %q", meta, want)
-			}
-			ids = append(ids, id)
-		}
-		if !slices.IsSorted(ids) {
-			t.Fatalf("ids are not sorted ascending: %v", ids)
-		}
-
-		// Round trip through BOTH real production functions: the parser recovers
-		// the exact map the serializer was handed.
-		if back := parsePackBlobTree(got); !maps.Equal(back, packs) {
-			t.Fatalf("round-trip mismatch:\n got  %v\n want %v", back, packs)
-		}
+		assertPackTreeEntries(t, got, packs)
 	})
+}
+
+// buildPacksFromRaw builds a packs map from fuzzed "<id> <oid>" lines (the first
+// space splits, so an id may carry later spaces). Duplicate ids take the last
+// line's oid, exactly as a map assignment would.
+func buildPacksFromRaw(raw string) map[string]string {
+	packs := map[string]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		id, oid, found := strings.Cut(line, " ")
+		if !found {
+			continue
+		}
+		packs[id] = oid
+	}
+	return packs
+}
+
+// packsAreClean reports whether every entry round-trips packTreeText's
+// serialization: an id must carry no tab or newline (the Cut and line
+// delimiters) and an oid must be non-empty and whitespace-free (it must be
+// exactly fields[2] of a 3-field meta). An unclean entry re-frames the
+// serialized lines and is out of scope for a faithful round trip.
+func packsAreClean(packs map[string]string) bool {
+	for id, oid := range packs {
+		if strings.ContainsAny(id, "\t\n") || oid == "" || strings.ContainsFunc(oid, unicode.IsSpace) {
+			return false
+		}
+	}
+	return true
+}
+
+// assertPackTreeEntries pins the per-entry, sort, and round-trip contracts on a
+// clean pack set: each entry is exactly one line "100644 blob <oid>\t<id>.age",
+// the ids appear in ascending order -- the reproducible-tree-identity contract
+// that only the real serializer's sort provides (and that the parse-side fuzzer
+// never exercises) -- and the parser recovers the exact map the serializer was
+// handed.
+func assertPackTreeEntries(t *testing.T, got string, packs map[string]string) {
+	t.Helper()
+	if n := strings.Count(got, "\n"); n != len(packs) {
+		t.Fatalf("emitted %d lines for %d packs", n, len(packs))
+	}
+	var ids []string
+	for _, e := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		meta, name, ok := strings.Cut(e, "\t")
+		if !ok || !strings.HasSuffix(name, ".age") {
+			t.Fatalf("entry %q is not <meta>\\t<id>.age", e)
+		}
+		id := strings.TrimSuffix(name, ".age")
+		if want := "100644 blob " + packs[id]; meta != want {
+			t.Fatalf("entry meta %q, want %q", meta, want)
+		}
+		ids = append(ids, id)
+	}
+	if !slices.IsSorted(ids) {
+		t.Fatalf("ids are not sorted ascending: %v", ids)
+	}
+
+	// Round trip through BOTH real production functions: the parser recovers
+	// the exact map the serializer was handed.
+	if back := parsePackBlobTree(got); !maps.Equal(back, packs) {
+		t.Fatalf("round-trip mismatch:\n got  %v\n want %v", back, packs)
+	}
 }

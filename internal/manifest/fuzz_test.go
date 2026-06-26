@@ -347,65 +347,90 @@ func FuzzValidatePackSet(f *testing.F) {
 			Packs:      packs,
 		}
 
-		// Independently re-derive whether the pack set violates any invariant
-		// validatePacks/validateReplaces enforce. Pack ids and Replaces ids are
-		// always well-formed (pool entries), and meta+refs are valid, so these
-		// are the ONLY reasons Validate can reject.
-		live := map[string]int{}
-		for _, p := range packs {
-			live[p.ID]++
-		}
-		dup := false
-		liveSet := map[string]bool{}
-		for id, n := range live {
-			liveSet[id] = true
-			if n > 1 {
-				dup = true
-			}
-		}
-		sizeBad := false
-		for _, p := range packs {
-			if p.Size < 0 || p.Size > maxPackSize {
-				sizeBad = true
-			}
-		}
-		overlap := false
-		for _, p := range packs {
-			for _, r := range p.Replaces {
-				if liveSet[r] {
-					overlap = true
-				}
-			}
-		}
-		countBad := len(packs) > maxPacks // unreachable here (capped), kept for completeness
-		wantReject := dup || sizeBad || overlap || countBad
+		v := derivePackSetVerdict(packs)
 
 		enc, err := Encode(m)
-		if (err != nil) != wantReject {
+		if (err != nil) != v.reject {
 			if err != nil {
 				t.Fatalf("Validate rejected a pack set with no invariant violation "+
-					"(dup=%v sizeBad=%v overlap=%v count=%d): %v", dup, sizeBad, overlap, len(packs), err)
+					"(dup=%v sizeBad=%v overlap=%v count=%d): %v", v.dup, v.sizeBad, v.overlap, v.count, err)
 			}
 			t.Fatalf("Validate ACCEPTED a pack set that violates an invariant "+
-				"(dup=%v sizeBad=%v overlap=%v count=%d)", dup, sizeBad, overlap, len(packs))
+				"(dup=%v sizeBad=%v overlap=%v count=%d)", v.dup, v.sizeBad, v.overlap, v.count)
 		}
 		if err != nil {
 			return // correctly rejected
 		}
 
 		// Accepted: the canonical bytes must Decode back and re-Encode identically.
-		m2, err := Decode(enc)
-		if err != nil {
-			t.Fatalf("Encode produced output Decode rejected: %v\n%s", err, enc)
-		}
-		enc2, err := Encode(m2)
-		if err != nil {
-			t.Fatalf("re-Encode of round-tripped manifest failed: %v", err)
-		}
-		if !bytes.Equal(enc, enc2) {
-			t.Fatalf("pack-set round trip not stable:\n first: %s\nsecond: %s", enc, enc2)
-		}
+		assertPackSetRoundTrip(t, enc)
 	})
+}
+
+// packSetVerdict is the independently re-derived expectation for whether
+// Validate must reject a pack set, plus the individual violation flags used to
+// describe a mismatch.
+type packSetVerdict struct {
+	dup, sizeBad, overlap bool
+	count                 int
+	reject                bool
+}
+
+// derivePackSetVerdict re-derives, independently of validatePacks/
+// validateReplaces, whether the pack set violates any invariant Validate
+// enforces. Pack ids and Replaces ids are always well-formed (pool entries),
+// and meta+refs are valid, so these are the ONLY reasons Validate can reject.
+// The set-intersection decomposition here is deliberately different from the
+// validator's single-pass seen map, so the oracle catches drift rather than
+// mirroring it.
+func derivePackSetVerdict(packs []Pack) packSetVerdict {
+	live := map[string]int{}
+	for _, p := range packs {
+		live[p.ID]++
+	}
+	var v packSetVerdict
+	liveSet := map[string]bool{}
+	for id, n := range live {
+		liveSet[id] = true
+		if n > 1 {
+			v.dup = true
+		}
+	}
+	for _, p := range packs {
+		if p.Size < 0 || p.Size > maxPackSize {
+			v.sizeBad = true
+		}
+	}
+	for _, p := range packs {
+		for _, r := range p.Replaces {
+			if liveSet[r] {
+				v.overlap = true
+			}
+		}
+	}
+	v.count = len(packs)
+	// count > maxPacks is unreachable here (packsFromFuzz caps the list), kept
+	// for completeness.
+	v.reject = v.dup || v.sizeBad || v.overlap || v.count > maxPacks
+	return v
+}
+
+// assertPackSetRoundTrip holds an accepted manifest's canonical bytes to the
+// byte-stable Decode/Encode round trip, generalizing FuzzEncodeRoundTrip to
+// arbitrary pack cardinality.
+func assertPackSetRoundTrip(t *testing.T, enc []byte) {
+	t.Helper()
+	m2, err := Decode(enc)
+	if err != nil {
+		t.Fatalf("Encode produced output Decode rejected: %v\n%s", err, enc)
+	}
+	enc2, err := Encode(m2)
+	if err != nil {
+		t.Fatalf("re-Encode of round-tripped manifest failed: %v", err)
+	}
+	if !bytes.Equal(enc, enc2) {
+		t.Fatalf("pack-set round trip not stable:\n first: %s\nsecond: %s", enc, enc2)
+	}
 }
 
 // metaRepoID builds a repo id that reaches both sides of validateMeta's repo-id

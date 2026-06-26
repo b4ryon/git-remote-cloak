@@ -155,89 +155,126 @@ func FuzzStatusPackStats(f *testing.F) {
 		if n > maxPacks {
 			n = maxPacks
 		}
-		packs := make([]manifest.Pack, n)
-		applied := map[string]bool{}
-
-		// Independent oracle accumulated alongside construction.
-		var usum uint64
-		var expLargest int64
-		expSmallest := int64(-1)
-		expApplied := 0
-
-		for i := 0; i < n; i++ {
-			// Clamp each decoded value into the post-Validate size range
-			// [0, maxPackSize] so the fuzzed packs are production-shaped; the
-			// modulo's range is exactly [0, maxPackSize] so the boundary is
-			// reachable.
-			v := binary.BigEndian.Uint64(data[i*8:])
-			size := int64(v % uint64(maxPackSize+1))
-			id := fmt.Sprintf("%064x", i) // distinct, valid 64-hex pack id
-
-			packs[i] = manifest.Pack{ID: id, Size: size}
-			usum += uint64(size)
-			if size > expLargest {
-				expLargest = size
-			}
-			if expSmallest < 0 || size < expSmallest {
-				expSmallest = size
-			}
-			if appliedMask&(uint64(1)<<(uint(i)%64)) != 0 {
-				applied[id] = true
-				expApplied++
-			}
-		}
-		// Ghost applied ids that name no live pack must never be counted.
-		applied["ghost-not-a-live-pack"] = true
-		applied[fmt.Sprintf("%064x", maxPacks+1)] = true
+		packs, applied, o := buildFuzzPacks(data, n, appliedMask, maxPackSize, maxPacks)
 
 		total, largest, smallest := packSizeStats(packs)
+		assertPackSizeStats(t, total, largest, smallest, o, n, maxPackSize)
 
-		// No-overflow proof: the sum fits in uint64 (<= 2^62 by the cap) and
-		// equals the int64 total exactly, so total never wrapped negative.
-		if usum > math.MaxInt64 {
-			t.Fatalf("oracle sum %d exceeds MaxInt64 (n=%d); cap invariant broken", usum, n)
-		}
-		if total != int64(usum) {
-			t.Fatalf("total=%d want %d (n=%d)", total, usum, n)
-		}
-		if total < 0 {
-			t.Fatalf("total=%d went negative (overflow) for n=%d", total, n)
-		}
-		if largest != expLargest {
-			t.Fatalf("largest=%d want %d (n=%d)", largest, expLargest, n)
-		}
-		if smallest != expSmallest {
-			t.Fatalf("smallest=%d want %d (n=%d)", smallest, expSmallest, n)
-		}
+		got := assertCountAppliedLive(t, packs, applied, o.applied, n, appliedMask)
 
-		// Empty-list sentinel vs the non-empty ordering contract.
-		if n == 0 {
-			if total != 0 || largest != 0 || smallest != -1 {
-				t.Fatalf("empty stats = (%d,%d,%d) want (0,0,-1)", total, largest, smallest)
-			}
-		} else if smallest < 0 || smallest > largest || largest > maxPackSize {
-			t.Fatalf("bad ordering: smallest=%d largest=%d maxPackSize=%d", smallest, largest, maxPackSize)
-		}
-
-		// countAppliedLive counts exactly the live packs in the applied set and
-		// never an applied id that names no live pack.
-		got := countAppliedLive(packs, applied)
-		if got != expApplied {
-			t.Fatalf("countAppliedLive=%d want %d (n=%d, mask=%#x)", got, expApplied, n, appliedMask)
-		}
-		if got > n {
-			t.Fatalf("countAppliedLive=%d exceeds live pack count %d", got, n)
-		}
-
-		// Determinism across re-evaluation.
-		total2, largest2, smallest2 := packSizeStats(packs)
-		if total2 != total || largest2 != largest || smallest2 != smallest {
-			t.Fatal("packSizeStats non-deterministic")
-		}
-		if countAppliedLive(packs, applied) != got {
-			t.Fatal("countAppliedLive non-deterministic")
-		}
+		assertStatsDeterministic(t, packs, applied, total, largest, smallest, got)
 	})
+}
+
+// packStatsOracle is the independently-accumulated expectation for a fuzzed
+// pack-size sequence: the uint64 sum (which also witnesses the no-overflow
+// proof), the max/min sizes, and the count of applied live packs.
+type packStatsOracle struct {
+	usum     uint64
+	largest  int64
+	smallest int64
+	applied  int
+}
+
+// buildFuzzPacks decodes data into n production-shaped packs (each size clamped
+// into the post-Validate range [0, maxPackSize]), records which are applied per
+// appliedMask, and accumulates the independent oracle alongside construction. It
+// also seeds two ghost applied ids that name no live pack, which countAppliedLive
+// must never count.
+func buildFuzzPacks(data []byte, n int, appliedMask uint64, maxPackSize int64, maxPacks int) ([]manifest.Pack, map[string]bool, packStatsOracle) {
+	packs := make([]manifest.Pack, n)
+	applied := map[string]bool{}
+	o := packStatsOracle{smallest: -1}
+
+	for i := 0; i < n; i++ {
+		// Clamp each decoded value into the post-Validate size range
+		// [0, maxPackSize] so the fuzzed packs are production-shaped; the
+		// modulo's range is exactly [0, maxPackSize] so the boundary is
+		// reachable.
+		v := binary.BigEndian.Uint64(data[i*8:])
+		size := int64(v % uint64(maxPackSize+1))
+		id := fmt.Sprintf("%064x", i) // distinct, valid 64-hex pack id
+
+		packs[i] = manifest.Pack{ID: id, Size: size}
+		o.usum += uint64(size)
+		if size > o.largest {
+			o.largest = size
+		}
+		if o.smallest < 0 || size < o.smallest {
+			o.smallest = size
+		}
+		if appliedMask&(uint64(1)<<(uint(i)%64)) != 0 {
+			applied[id] = true
+			o.applied++
+		}
+	}
+	// Ghost applied ids that name no live pack must never be counted.
+	applied["ghost-not-a-live-pack"] = true
+	applied[fmt.Sprintf("%064x", maxPacks+1)] = true
+	return packs, applied, o
+}
+
+// assertPackSizeStats pins packSizeStats against the oracle: the int64 total
+// equals the uint64 sum exactly (so it never wrapped negative under the
+// maxPacks*maxPackSize == 2^62 cap), largest/smallest match the max/min, and the
+// empty-list sentinel (0,0,-1) vs the non-empty ordering contract both hold.
+func assertPackSizeStats(t *testing.T, total, largest, smallest int64, o packStatsOracle, n int, maxPackSize int64) {
+	t.Helper()
+	// No-overflow proof: the sum fits in uint64 (<= 2^62 by the cap) and
+	// equals the int64 total exactly, so total never wrapped negative.
+	if o.usum > math.MaxInt64 {
+		t.Fatalf("oracle sum %d exceeds MaxInt64 (n=%d); cap invariant broken", o.usum, n)
+	}
+	if total != int64(o.usum) {
+		t.Fatalf("total=%d want %d (n=%d)", total, o.usum, n)
+	}
+	if total < 0 {
+		t.Fatalf("total=%d went negative (overflow) for n=%d", total, n)
+	}
+	if largest != o.largest {
+		t.Fatalf("largest=%d want %d (n=%d)", largest, o.largest, n)
+	}
+	if smallest != o.smallest {
+		t.Fatalf("smallest=%d want %d (n=%d)", smallest, o.smallest, n)
+	}
+
+	// Empty-list sentinel vs the non-empty ordering contract.
+	if n == 0 {
+		if total != 0 || largest != 0 || smallest != -1 {
+			t.Fatalf("empty stats = (%d,%d,%d) want (0,0,-1)", total, largest, smallest)
+		}
+	} else if smallest < 0 || smallest > largest || largest > maxPackSize {
+		t.Fatalf("bad ordering: smallest=%d largest=%d maxPackSize=%d", smallest, largest, maxPackSize)
+	}
+}
+
+// assertCountAppliedLive pins countAppliedLive: it counts exactly the live packs
+// whose id is in the applied set, never an applied id that names no live pack,
+// and never more than the live pack count. It returns the count for the
+// determinism check.
+func assertCountAppliedLive(t *testing.T, packs []manifest.Pack, applied map[string]bool, expApplied, n int, appliedMask uint64) int {
+	t.Helper()
+	got := countAppliedLive(packs, applied)
+	if got != expApplied {
+		t.Fatalf("countAppliedLive=%d want %d (n=%d, mask=%#x)", got, expApplied, n, appliedMask)
+	}
+	if got > n {
+		t.Fatalf("countAppliedLive=%d exceeds live pack count %d", got, n)
+	}
+	return got
+}
+
+// assertStatsDeterministic re-evaluates both consumers on the same inputs and
+// pins that they reproduce their first results exactly.
+func assertStatsDeterministic(t *testing.T, packs []manifest.Pack, applied map[string]bool, total, largest, smallest int64, got int) {
+	t.Helper()
+	total2, largest2, smallest2 := packSizeStats(packs)
+	if total2 != total || largest2 != largest || smallest2 != smallest {
+		t.Fatal("packSizeStats non-deterministic")
+	}
+	if countAppliedLive(packs, applied) != got {
+		t.Fatal("countAppliedLive non-deterministic")
+	}
 }
 
 // FuzzSeedManifest pins seedManifest, the genesis (generation-1) manifest
@@ -282,67 +319,92 @@ func FuzzSeedManifest(f *testing.F) {
 
 		m := seedManifest(repoID, head, refs, packID, packSize)
 
-		// Version carried from manifest.New (the build's wire version).
-		if m.Version != manifest.Version {
-			t.Fatalf("Version = %d, want %d", m.Version, manifest.Version)
-		}
-		// Generation is exactly 1: the genesis is NOT a bump of some prior
-		// generation, it is the rollback baseline the first pin records.
-		if m.Generation != 1 {
-			t.Fatalf("Generation = %d, want 1 (genesis baseline)", m.Generation)
-		}
-		// Repo identity and head installed verbatim (the repo id is the
-		// substitution-detection anchor; both must survive unchanged).
-		if m.RepoID != repoID {
-			t.Fatalf("RepoID = %q, want %q", m.RepoID, repoID)
-		}
-		if m.Head != head {
-			t.Fatalf("Head = %q, want %q", m.Head, head)
-		}
-		// Refs installed wholesale.
-		if !maps.Equal(m.Refs, wantRefs) {
-			t.Fatalf("Refs = %v, want %v", m.Refs, wantRefs)
-		}
-		// Exactly one pack, carrying the given id/size and NO Replaces: a seed
-		// has no prior packs to supersede, so a non-empty Replaces would falsely
-		// claim to retire packs that never existed (the packSkippable contract),
-		// and any count other than one would mis-describe the single packed
-		// history.
-		if len(m.Packs) != 1 {
-			t.Fatalf("got %d packs, want exactly 1 (genesis)", len(m.Packs))
-		}
-		p := m.Packs[0]
-		if p.ID != packID || p.Size != packSize || len(p.Replaces) != 0 {
-			t.Fatalf("seed pack = {%q,%d,replaces=%v}, want {%q,%d,nil}",
-				p.ID, p.Size, p.Replaces, packID, packSize)
-		}
-
-		// Persistence tie: buildSeedManifest's next step is manifest.Encode,
-		// which validates. Encoding is not guaranteed to succeed for arbitrary
-		// (invalid) fuzzed fields, but WHEN it does the manifest must round-trip
-		// byte-stably through Decode -- the seed-path analog of the accepted-
-		// manifest round trips the manifest Validate fuzzers pin.
-		if enc, err := manifest.Encode(m); err == nil {
-			dec, err := manifest.Decode(enc)
-			if err != nil {
-				t.Fatalf("Decode of an Encode-accepted seed manifest failed: %v", err)
-			}
-			enc2, err := manifest.Encode(dec)
-			if err != nil {
-				t.Fatalf("re-Encode of decoded seed manifest failed: %v", err)
-			}
-			if !bytes.Equal(enc, enc2) {
-				t.Fatalf("seed manifest not byte-stable across Decode/Encode")
-			}
-		}
-
-		// Determinism: a rebuild from a fresh refs clone reproduces the result.
-		m2 := seedManifest(repoID, head, maps.Clone(wantRefs), packID, packSize)
-		if m2.Version != m.Version || m2.Generation != m.Generation ||
-			m2.RepoID != m.RepoID || m2.Head != m.Head ||
-			!maps.Equal(m2.Refs, wantRefs) || len(m2.Packs) != 1 ||
-			m2.Packs[0].ID != packID || m2.Packs[0].Size != packSize {
-			t.Fatal("seedManifest not deterministic")
-		}
+		assertSeedFields(t, m, repoID, head, wantRefs)
+		assertSeedPack(t, m, packID, packSize)
+		assertSeedPersistence(t, m)
+		assertSeedDeterministic(t, repoID, head, wantRefs, packID, packSize, m)
 	})
+}
+
+// assertSeedFields pins the genesis header invariants Validate cannot see: the
+// wire version from manifest.New, generation exactly 1 (the rollback baseline,
+// not a bump of a prior generation), the repo-identity/head anchors installed
+// verbatim, and the refs installed wholesale.
+func assertSeedFields(t *testing.T, m *manifest.Manifest, repoID, head string, wantRefs map[string]string) {
+	t.Helper()
+	// Version carried from manifest.New (the build's wire version).
+	if m.Version != manifest.Version {
+		t.Fatalf("Version = %d, want %d", m.Version, manifest.Version)
+	}
+	// Generation is exactly 1: the genesis is NOT a bump of some prior
+	// generation, it is the rollback baseline the first pin records.
+	if m.Generation != 1 {
+		t.Fatalf("Generation = %d, want 1 (genesis baseline)", m.Generation)
+	}
+	// Repo identity and head installed verbatim (the repo id is the
+	// substitution-detection anchor; both must survive unchanged).
+	if m.RepoID != repoID {
+		t.Fatalf("RepoID = %q, want %q", m.RepoID, repoID)
+	}
+	if m.Head != head {
+		t.Fatalf("Head = %q, want %q", m.Head, head)
+	}
+	// Refs installed wholesale.
+	if !maps.Equal(m.Refs, wantRefs) {
+		t.Fatalf("Refs = %v, want %v", m.Refs, wantRefs)
+	}
+}
+
+// assertSeedPack pins the single-pack genesis invariant: exactly one pack
+// carrying the given id/size and NO Replaces. A seed has no prior packs to
+// supersede, so a non-empty Replaces would falsely claim to retire packs that
+// never existed (the packSkippable contract), and any count other than one would
+// mis-describe the single packed history.
+func assertSeedPack(t *testing.T, m *manifest.Manifest, packID string, packSize int64) {
+	t.Helper()
+	if len(m.Packs) != 1 {
+		t.Fatalf("got %d packs, want exactly 1 (genesis)", len(m.Packs))
+	}
+	p := m.Packs[0]
+	if p.ID != packID || p.Size != packSize || len(p.Replaces) != 0 {
+		t.Fatalf("seed pack = {%q,%d,replaces=%v}, want {%q,%d,nil}",
+			p.ID, p.Size, p.Replaces, packID, packSize)
+	}
+}
+
+// assertSeedPersistence pins the persistence tie: buildSeedManifest's next step
+// is manifest.Encode (which validates). Encoding is not guaranteed to succeed
+// for arbitrary (invalid) fuzzed fields, but WHEN it does the manifest must
+// round-trip byte-stably through Decode -- the seed-path analog of the accepted-
+// manifest round trips the manifest Validate fuzzers pin.
+func assertSeedPersistence(t *testing.T, m *manifest.Manifest) {
+	t.Helper()
+	enc, err := manifest.Encode(m)
+	if err != nil {
+		return
+	}
+	dec, err := manifest.Decode(enc)
+	if err != nil {
+		t.Fatalf("Decode of an Encode-accepted seed manifest failed: %v", err)
+	}
+	enc2, err := manifest.Encode(dec)
+	if err != nil {
+		t.Fatalf("re-Encode of decoded seed manifest failed: %v", err)
+	}
+	if !bytes.Equal(enc, enc2) {
+		t.Fatalf("seed manifest not byte-stable across Decode/Encode")
+	}
+}
+
+// assertSeedDeterministic pins that a rebuild from a fresh refs clone reproduces
+// the same manifest header and single pack.
+func assertSeedDeterministic(t *testing.T, repoID, head string, wantRefs map[string]string, packID string, packSize int64, m *manifest.Manifest) {
+	t.Helper()
+	m2 := seedManifest(repoID, head, maps.Clone(wantRefs), packID, packSize)
+	if m2.Version != m.Version || m2.Generation != m.Generation ||
+		m2.RepoID != m.RepoID || m2.Head != m.Head ||
+		!maps.Equal(m2.Refs, wantRefs) || len(m2.Packs) != 1 ||
+		m2.Packs[0].ID != packID || m2.Packs[0].Size != packSize {
+		t.Fatal("seedManifest not deterministic")
+	}
 }

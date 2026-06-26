@@ -220,6 +220,92 @@ func FuzzListAdvertisementFraming(f *testing.F) {
 	})
 }
 
+// assertEmptyRemoteAdvertises pins list's empty-remote contract: a nil-Manifest
+// RemoteState must advertise zero lines for both list and list-for-push, so git
+// sees only Main's terminating blank and treats the remote as empty.
+func assertEmptyRemoteAdvertises(t *testing.T, s *session) {
+	t.Helper()
+	for _, forPush := range []bool{false, true} {
+		lines, err := s.list(forPush)
+		if err != nil {
+			t.Fatalf("list(forPush=%v) on empty remote failed: %v", forPush, err)
+		}
+		if len(lines) != 0 {
+			t.Fatalf("list(forPush=%v) on empty remote advertised %d lines, want 0: %q", forPush, len(lines), lines)
+		}
+	}
+}
+
+// parseAdvertisement decodes a ref advertisement back into its ref->oid map while
+// pinning the per-line framing invariants: no embedded newline, the optional
+// "@<head> HEAD" line is detected and counted (and no ref line may follow it),
+// each ref line splits cleanly on its single space, no ref is advertised twice,
+// and ref lines ascend by name. It returns the recovered map and the number of
+// HEAD lines seen for the caller's HEAD-presence check.
+func parseAdvertisement(t *testing.T, lines []string, forPush bool) (map[string]string, int) {
+	t.Helper()
+	parsed := map[string]string{}
+	prevName := ""
+	seenHead := false
+	headLines := 0
+	for _, l := range lines {
+		if strings.ContainsAny(l, "\n\r") {
+			t.Fatalf("list(forPush=%v) line %q carries an embedded newline", forPush, l)
+		}
+		if strings.HasPrefix(l, "@") {
+			seenHead = true
+			headLines++
+			continue
+		}
+		if seenHead {
+			t.Fatalf("list(forPush=%v) emitted ref line %q after the HEAD line", forPush, l)
+		}
+		oid, name, ok := strings.Cut(l, " ")
+		if !ok {
+			t.Fatalf("list(forPush=%v) ref line %q has no space", forPush, l)
+		}
+		if _, dup := parsed[name]; dup {
+			t.Fatalf("list(forPush=%v) advertised ref %q twice", forPush, name)
+		}
+		if prevName != "" && name <= prevName {
+			t.Fatalf("list(forPush=%v) ref lines not ascending: %q after %q", forPush, name, prevName)
+		}
+		parsed[name] = oid
+		prevName = name
+	}
+	return parsed, headLines
+}
+
+// assertAdvertisementHead pins the post-parse half of list's contract: the ref
+// lines recover exactly the manifest's refs, and the "@<head> HEAD" symref line
+// is present exactly once and last iff this is a non-for-push list with a
+// non-empty HeadForList selection.
+func assertAdvertisementHead(t *testing.T, lines []string, m *manifest.Manifest, forPush bool, parsed map[string]string, headLines int) {
+	t.Helper()
+	// Faithful: the ref lines are exactly the manifest's refs.
+	if !maps.Equal(parsed, m.Refs) {
+		t.Fatalf("list(forPush=%v) advertised refs %v != manifest refs %v", forPush, parsed, m.Refs)
+	}
+	// The HEAD symref line is present exactly once and last iff this is a
+	// non-for-push list with a non-empty HeadForList selection.
+	wantHead := ""
+	if !forPush {
+		wantHead = engine.HeadForList(m)
+	}
+	if wantHead == "" {
+		if headLines != 0 {
+			t.Fatalf("list(forPush=%v) emitted %d HEAD lines, want 0", forPush, headLines)
+		}
+		return
+	}
+	if headLines != 1 {
+		t.Fatalf("list(forPush=%v) emitted %d HEAD lines, want 1", forPush, headLines)
+	}
+	if want := "@" + wantHead + " HEAD"; lines[len(lines)-1] != want {
+		t.Fatalf("list(forPush=%v) HEAD line = %q, want %q", forPush, lines[len(lines)-1], want)
+	}
+}
+
 // FuzzListAdvertisement pins the multi-ref faithfulness, ordering, and HEAD
 // framing of the ref advertisement the helper emits from a validated manifest.
 // Where FuzzListAdvertisementFraming drives a single ref to prove no line
@@ -262,16 +348,7 @@ func FuzzListAdvertisement(f *testing.F) {
 		// Empty remote: nil Manifest must advertise nothing, regardless of any
 		// (ignored) head/refs the fuzzer supplies, for both list and for-push.
 		if emptyRemote {
-			s := &session{ready: true, rs: &engine.RemoteState{}}
-			for _, forPush := range []bool{false, true} {
-				lines, err := s.list(forPush)
-				if err != nil {
-					t.Fatalf("list(forPush=%v) on empty remote failed: %v", forPush, err)
-				}
-				if len(lines) != 0 {
-					t.Fatalf("list(forPush=%v) on empty remote advertised %d lines, want 0: %q", forPush, len(lines), lines)
-				}
-			}
+			assertEmptyRemoteAdvertises(t, &session{ready: true, rs: &engine.RemoteState{}})
 			return
 		}
 
@@ -299,57 +376,8 @@ func FuzzListAdvertisement(f *testing.F) {
 			if err != nil {
 				t.Fatalf("list(forPush=%v) failed on a validated manifest: %v", forPush, err)
 			}
-			parsed := map[string]string{}
-			prevName := ""
-			seenHead := false
-			headLines := 0
-			for _, l := range lines {
-				if strings.ContainsAny(l, "\n\r") {
-					t.Fatalf("list(forPush=%v) line %q carries an embedded newline", forPush, l)
-				}
-				if strings.HasPrefix(l, "@") {
-					seenHead = true
-					headLines++
-					continue
-				}
-				if seenHead {
-					t.Fatalf("list(forPush=%v) emitted ref line %q after the HEAD line", forPush, l)
-				}
-				oid, name, ok := strings.Cut(l, " ")
-				if !ok {
-					t.Fatalf("list(forPush=%v) ref line %q has no space", forPush, l)
-				}
-				if _, dup := parsed[name]; dup {
-					t.Fatalf("list(forPush=%v) advertised ref %q twice", forPush, name)
-				}
-				if prevName != "" && name <= prevName {
-					t.Fatalf("list(forPush=%v) ref lines not ascending: %q after %q", forPush, name, prevName)
-				}
-				parsed[name] = oid
-				prevName = name
-			}
-			// Faithful: the ref lines are exactly the manifest's refs.
-			if !maps.Equal(parsed, m.Refs) {
-				t.Fatalf("list(forPush=%v) advertised refs %v != manifest refs %v", forPush, parsed, m.Refs)
-			}
-			// The HEAD symref line is present exactly once and last iff this is a
-			// non-for-push list with a non-empty HeadForList selection.
-			wantHead := ""
-			if !forPush {
-				wantHead = engine.HeadForList(m)
-			}
-			if wantHead == "" {
-				if headLines != 0 {
-					t.Fatalf("list(forPush=%v) emitted %d HEAD lines, want 0", forPush, headLines)
-				}
-				continue
-			}
-			if headLines != 1 {
-				t.Fatalf("list(forPush=%v) emitted %d HEAD lines, want 1", forPush, headLines)
-			}
-			if want := "@" + wantHead + " HEAD"; lines[len(lines)-1] != want {
-				t.Fatalf("list(forPush=%v) HEAD line = %q, want %q", forPush, lines[len(lines)-1], want)
-			}
+			parsed, headLines := parseAdvertisement(t, lines, forPush)
+			assertAdvertisementHead(t, lines, m, forPush, parsed, headLines)
 		}
 	})
 }
@@ -370,6 +398,57 @@ func FuzzOption(f *testing.F) {
 			t.Fatalf("option(%q) = %q, want \"ok\" or \"unsupported\"", rest, reply)
 		}
 	})
+}
+
+// assertOptionReply pins the reply classification: "ok" for the four known
+// options (verbosity/progress/dry-run/force), "unsupported" for anything else.
+func assertOptionReply(t *testing.T, rest, name, reply string) {
+	t.Helper()
+	known := name == "verbosity" || name == "progress" || name == "dry-run" || name == "force"
+	wantReply := "unsupported"
+	if known {
+		wantReply = "ok"
+	}
+	if reply != wantReply {
+		t.Fatalf("option(%q) reply = %q, want %q", rest, reply, wantReply)
+	}
+}
+
+// assertOptionState pins option's state-mutation contract against the
+// independently-split name/value: forceAll and dryRun flip only for their own
+// option name and only on the exact value "true"; verbosity is untouched by any
+// non-"verbosity" option; and on the clean decimal-integer domain "verbosity <n>"
+// sets verbosity to n. The session arrives pre-seeded with the non-default
+// sentinels (forceAll/dryRun true, verbosity initVerb) so a spurious write shows.
+func assertOptionState(t *testing.T, rest, name, value string, s *session, initVerb int) {
+	t.Helper()
+	// Boolean exact-"true" semantics + isolation: forceAll/dryRun change only
+	// for their own option name, and only to value=="true".
+	wantForce := true // initial sentinel
+	if name == "force" {
+		wantForce = value == "true"
+	}
+	if s.forceAll != wantForce {
+		t.Fatalf("option(%q): forceAll = %v, want %v", rest, s.forceAll, wantForce)
+	}
+	wantDry := true // initial sentinel
+	if name == "dry-run" {
+		wantDry = value == "true"
+	}
+	if s.dryRun != wantDry {
+		t.Fatalf("option(%q): dryRun = %v, want %v", rest, s.dryRun, wantDry)
+	}
+
+	// verbosity isolation: no non-"verbosity" option may touch it.
+	if name != "verbosity" && s.verbosity != initVerb {
+		t.Fatalf("option(%q): verbosity changed to %d by a non-verbosity option", rest, s.verbosity)
+	}
+	// On the clean decimal-integer domain, "verbosity <n>" sets verbosity to n.
+	if name == "verbosity" {
+		if n, err := strconv.Atoi(value); err == nil && s.verbosity != n {
+			t.Fatalf("option(%q): verbosity = %d, want %d", rest, s.verbosity, n)
+		}
+	}
 }
 
 // FuzzOptionState fuzzes the STATE-MUTATION contract of the "option" command --
@@ -432,44 +511,53 @@ func FuzzOptionState(f *testing.F) {
 			name, value = rest[:i], rest[i+1:]
 		}
 
-		// Reply classification.
-		known := name == "verbosity" || name == "progress" || name == "dry-run" || name == "force"
-		wantReply := "unsupported"
-		if known {
-			wantReply = "ok"
-		}
-		if reply != wantReply {
-			t.Fatalf("option(%q) reply = %q, want %q", rest, reply, wantReply)
-		}
+		assertOptionReply(t, rest, name, reply)
+		assertOptionState(t, rest, name, value, s, initVerb)
+	})
+}
 
-		// Boolean exact-"true" semantics + isolation: forceAll/dryRun change only
-		// for their own option name, and only to value=="true".
-		wantForce := true // initial sentinel
-		if name == "force" {
-			wantForce = value == "true"
-		}
-		if s.forceAll != wantForce {
-			t.Fatalf("option(%q): forceAll = %v, want %v", rest, s.forceAll, wantForce)
-		}
-		wantDry := true // initial sentinel
-		if name == "dry-run" {
-			wantDry = value == "true"
-		}
-		if s.dryRun != wantDry {
-			t.Fatalf("option(%q): dryRun = %v, want %v", rest, s.dryRun, wantDry)
-		}
-
-		// verbosity isolation: no non-"verbosity" option may touch it.
-		if name != "verbosity" && s.verbosity != initVerb {
-			t.Fatalf("option(%q): verbosity changed to %d by a non-verbosity option", rest, s.verbosity)
-		}
-		// On the clean decimal-integer domain, "verbosity <n>" sets verbosity to n.
-		if name == "verbosity" {
-			if n, err := strconv.Atoi(value); err == nil && s.verbosity != n {
-				t.Fatalf("option(%q): verbosity = %d, want %d", rest, s.verbosity, n)
+// buildDispatchScript turns an opcode stream into the protocol script fed to
+// Main and, in lockstep, the exact stdout and exit code Main must produce. Main
+// stops dispatching at the first blank or unknown line, so the expectation stops
+// accumulating there too (terminated) while the script keeps the trailing
+// never-read lines. Each option answer is computed via the real option() so the
+// oracle restates neither the capabilities block nor option's reply logic.
+func buildDispatchScript(ops []byte, arg string) (string, string, int) {
+	ref := &session{} // computes each option answer via the real option()
+	var script, want strings.Builder
+	wantCode := 0
+	terminated := false
+	for _, op := range ops {
+		switch op % 4 {
+		case 0:
+			script.WriteString("capabilities\n")
+			if !terminated {
+				for _, c := range capabilities {
+					want.WriteString(c)
+					want.WriteByte('\n')
+				}
+				want.WriteByte('\n')
+			}
+		case 1:
+			script.WriteString("option " + arg + "\n")
+			if !terminated {
+				want.WriteString(ref.option(arg))
+				want.WriteByte('\n')
+			}
+		case 2:
+			script.WriteString("\n")
+			if !terminated {
+				terminated = true // the blank line ends the dialogue cleanly (exit 0)
+			}
+		case 3:
+			script.WriteString("zzz-unknown\n")
+			if !terminated {
+				terminated = true
+				wantCode = 1 // unknown command -> fatal on stderr, exit 1
 			}
 		}
-	})
+	}
+	return script.String(), want.String(), wantCode
 }
 
 // FuzzDispatchSession fuzzes the helper's top-level protocol dispatch loop --
@@ -526,52 +614,17 @@ func FuzzDispatchSession(f *testing.F) {
 		}
 
 		// Build the protocol script and, in lockstep, the exact stdout and exit
-		// code Main must produce. Main stops dispatching at the first blank or
-		// unknown line, so the expectation stops accumulating there too while the
-		// script keeps the trailing (never-read) lines.
-		ref := &session{} // computes each option answer via the real option()
-		var script, want strings.Builder
-		wantCode := 0
-		terminated := false
-		for _, op := range ops {
-			switch op % 4 {
-			case 0:
-				script.WriteString("capabilities\n")
-				if !terminated {
-					for _, c := range capabilities {
-						want.WriteString(c)
-						want.WriteByte('\n')
-					}
-					want.WriteByte('\n')
-				}
-			case 1:
-				script.WriteString("option " + arg + "\n")
-				if !terminated {
-					want.WriteString(ref.option(arg))
-					want.WriteByte('\n')
-				}
-			case 2:
-				script.WriteString("\n")
-				if !terminated {
-					terminated = true // the blank line ends the dialogue cleanly (exit 0)
-				}
-			case 3:
-				script.WriteString("zzz-unknown\n")
-				if !terminated {
-					terminated = true
-					wantCode = 1 // unknown command -> fatal on stderr, exit 1
-				}
-			}
-		}
+		// code Main must produce.
+		script, want, wantCode := buildDispatchScript(ops, arg)
 
 		var out, errBuf bytes.Buffer
-		code := Main([]string{"origin", "cloak::x"}, strings.NewReader(script.String()), &out, &errBuf)
+		code := Main([]string{"origin", "cloak::x"}, strings.NewReader(script), &out, &errBuf)
 
 		if code != wantCode {
 			t.Fatalf("Main exit code = %d, want %d (ops=%v arg=%q)", code, wantCode, ops, arg)
 		}
-		if got := out.String(); got != want.String() {
-			t.Fatalf("dispatch stdout mismatch (ops=%v arg=%q):\n got %q\nwant %q", ops, arg, got, want.String())
+		if got := out.String(); got != want {
+			t.Fatalf("dispatch stdout mismatch (ops=%v arg=%q):\n got %q\nwant %q", ops, arg, got, want)
 		}
 	})
 }

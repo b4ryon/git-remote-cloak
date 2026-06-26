@@ -92,63 +92,79 @@ func FuzzConfigRoundTrip(f *testing.F) {
 			return
 		}
 
-		var b strings.Builder
-		if keyRef != "" {
-			b.WriteString("cloak.keyref " + keyRef + "\n")
-		}
-		b.WriteString("cloak.geometricfactor " + strconv.Itoa(factor) + "\n")
-		b.WriteString("cloak.pushretries " + strconv.Itoa(retries) + "\n")
-		if branch != "" {
-			b.WriteString("cloak.branch " + branch + "\n")
-		}
-		if logLevel != "" {
-			b.WriteString("cloak.loglevel " + logLevel + "\n")
-		}
-
 		c := Defaults()
-		applyConfigLines(&c, b.String())
+		applyConfigLines(&c, buildRoundTripOutput(keyRef, branch, logLevel, factor, retries))
 
-		// String settings: a non-empty value is loaded verbatim; an empty value
-		// emits no line so the documented default stands.
-		wantKeyRef := keystore.DefaultRef()
-		if keyRef != "" {
-			wantKeyRef = keyRef
-		}
-		if c.KeyRef != wantKeyRef {
-			t.Fatalf("KeyRef: got %q want %q", c.KeyRef, wantKeyRef)
-		}
-		wantBranch := "cloak"
-		if branch != "" {
-			wantBranch = branch
-		}
-		if c.Branch != wantBranch {
-			t.Fatalf("Branch: got %q want %q", c.Branch, wantBranch)
-		}
-		wantLog := "info"
-		if logLevel != "" {
-			wantLog = logLevel
-		}
-		if c.LogLevel != wantLog {
-			t.Fatalf("LogLevel: got %q want %q", c.LogLevel, wantLog)
-		}
-
-		// Numeric settings apply only inside their documented range; otherwise
-		// the default survives (GeometricFactor >= 0, PushRetries >= 1).
-		wantFactor := 2
-		if factor >= 0 {
-			wantFactor = factor
-		}
-		if c.GeometricFactor != wantFactor {
-			t.Fatalf("GeometricFactor: got %d want %d (in=%d)", c.GeometricFactor, wantFactor, factor)
-		}
-		wantRetries := 5
-		if retries >= 1 {
-			wantRetries = retries
-		}
-		if c.PushRetries != wantRetries {
-			t.Fatalf("PushRetries: got %d want %d (in=%d)", c.PushRetries, wantRetries, retries)
-		}
+		assertRoundTripStrings(t, c, keyRef, branch, logLevel)
+		assertRoundTripNumerics(t, c, factor, retries)
 	})
+}
+
+// buildRoundTripOutput renders the `git config --get-regexp ^cloak\.` output
+// that setting each cloak.* key to the given value would produce. Empty string
+// values emit no line, mirroring git omitting an unset key.
+func buildRoundTripOutput(keyRef, branch, logLevel string, factor, retries int) string {
+	var b strings.Builder
+	if keyRef != "" {
+		b.WriteString("cloak.keyref " + keyRef + "\n")
+	}
+	b.WriteString("cloak.geometricfactor " + strconv.Itoa(factor) + "\n")
+	b.WriteString("cloak.pushretries " + strconv.Itoa(retries) + "\n")
+	if branch != "" {
+		b.WriteString("cloak.branch " + branch + "\n")
+	}
+	if logLevel != "" {
+		b.WriteString("cloak.loglevel " + logLevel + "\n")
+	}
+	return b.String()
+}
+
+// assertRoundTripStrings verifies the string settings: a non-empty value is
+// loaded verbatim; an empty value emits no line so the documented default stands.
+func assertRoundTripStrings(t *testing.T, c Config, keyRef, branch, logLevel string) {
+	t.Helper()
+	wantKeyRef := keystore.DefaultRef()
+	if keyRef != "" {
+		wantKeyRef = keyRef
+	}
+	if c.KeyRef != wantKeyRef {
+		t.Fatalf("KeyRef: got %q want %q", c.KeyRef, wantKeyRef)
+	}
+	wantBranch := "cloak"
+	if branch != "" {
+		wantBranch = branch
+	}
+	if c.Branch != wantBranch {
+		t.Fatalf("Branch: got %q want %q", c.Branch, wantBranch)
+	}
+	wantLog := "info"
+	if logLevel != "" {
+		wantLog = logLevel
+	}
+	if c.LogLevel != wantLog {
+		t.Fatalf("LogLevel: got %q want %q", c.LogLevel, wantLog)
+	}
+}
+
+// assertRoundTripNumerics verifies the numeric settings apply only inside their
+// documented range; otherwise the default survives (GeometricFactor >= 0,
+// PushRetries >= 1).
+func assertRoundTripNumerics(t *testing.T, c Config, factor, retries int) {
+	t.Helper()
+	wantFactor := 2
+	if factor >= 0 {
+		wantFactor = factor
+	}
+	if c.GeometricFactor != wantFactor {
+		t.Fatalf("GeometricFactor: got %d want %d (in=%d)", c.GeometricFactor, wantFactor, factor)
+	}
+	wantRetries := 5
+	if retries >= 1 {
+		wantRetries = retries
+	}
+	if c.PushRetries != wantRetries {
+		t.Fatalf("PushRetries: got %d want %d (in=%d)", c.PushRetries, wantRetries, retries)
+	}
 }
 
 // clean reports whether s can round-trip as a single `key value` field: it has

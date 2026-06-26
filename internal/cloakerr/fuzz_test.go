@@ -55,39 +55,8 @@ func FuzzClassifiedError(f *testing.F) {
 
 		msg := e.Error()
 
-		// Determinism: a pure render of the struct fields.
-		if again := e.Error(); again != msg {
-			t.Fatalf("Error() not deterministic: %q vs %q", msg, again)
-		}
-
-		// Universal prefix: every classified error, for any Kind including
-		// out-of-range, begins with "cloak:" (in-range kinds via kindInfo, the
-		// out-of-range fallback via the literal "cloak: error").
-		if !strings.HasPrefix(msg, "cloak:") {
-			t.Fatalf("Error() lost the cloak prefix: %q", msg)
-		}
-
-		// Message must not re-prefix a cloak error: it already starts with
-		// "cloak:", so Message is a no-op on it. This is what the helper/CLI
-		// rely on when they print Message(err) for a classified failure.
-		if got := Message(e); got != msg {
-			t.Fatalf("Message mangled a cloak error:\n got %q\nwant %q", got, msg)
-		}
-
-		// The escalation contract: the distinctive alarm wording survives into
-		// operator-visible output no matter what host-influenced text the
-		// Op/Err/Hint carry. Asserted on Message (the real production consumer)
-		// against the literal substrings the security suite greps for.
-		switch kind {
-		case Tamper:
-			if !strings.Contains(Message(e), "TAMPER ALARM") {
-				t.Fatalf("Tamper error dropped the alarm wording: %q", msg)
-			}
-		case Rollback:
-			if !strings.Contains(Message(e), "ROLLBACK ALARM") {
-				t.Fatalf("Rollback error dropped the alarm wording: %q", msg)
-			}
-		}
+		assertCloakRender(t, e, msg)
+		assertAlarmWording(t, kind, e, msg)
 
 		// Classification survives the wrapping: KindOf returns the set Kind for
 		// any value (it does not range-validate), so backend.go's retry gate
@@ -96,23 +65,76 @@ func FuzzClassifiedError(f *testing.F) {
 			t.Fatalf("KindOf(e) = (%v, %v), want (%v, true)", k, ok, kind)
 		}
 
-		// Host context faithfulness: non-empty Op/Err/Hint each appear verbatim
-		// in the message (appended, never truncated or escaped), so a hostile
-		// host cannot make cloak silently swallow the failure detail.
-		if op != "" && !strings.Contains(msg, op) {
-			t.Fatalf("Op not present in message: op=%q msg=%q", op, msg)
-		}
-		if hasErr && errText != "" && !strings.Contains(msg, errText) {
-			t.Fatalf("Err text not present in message: err=%q msg=%q", errText, msg)
-		}
-		// The hint is appended last, so when present it is exactly the message
-		// suffix. A Contains check would false-positive when host-influenced
-		// Op/Err text happens to embed the "\n  hint: " sequence; HasSuffix
-		// pins the real structural contract instead.
-		if hint != "" && !strings.HasSuffix(msg, "\n  hint: "+hint) {
-			t.Fatalf("Hint line missing or malformed: hint=%q msg=%q", hint, msg)
-		}
+		assertHostContextFaithful(t, op, errText, hasErr, hint, msg)
 	})
+}
+
+// assertCloakRender pins the three universal rendering contracts on a classified
+// error: Error() is a deterministic pure render of the struct fields, every
+// classified error begins with the "cloak:" prefix, and Message is a no-op on it
+// (it already carries the prefix) - what the helper/CLI rely on when they print
+// Message(err) for a classified failure.
+func assertCloakRender(t *testing.T, e *Error, msg string) {
+	t.Helper()
+
+	// Determinism: a pure render of the struct fields.
+	if again := e.Error(); again != msg {
+		t.Fatalf("Error() not deterministic: %q vs %q", msg, again)
+	}
+
+	// Universal prefix: every classified error, for any Kind including
+	// out-of-range, begins with "cloak:" (in-range kinds via kindInfo, the
+	// out-of-range fallback via the literal "cloak: error").
+	if !strings.HasPrefix(msg, "cloak:") {
+		t.Fatalf("Error() lost the cloak prefix: %q", msg)
+	}
+
+	// Message must not re-prefix a cloak error: it already starts with
+	// "cloak:", so Message is a no-op on it. This is what the helper/CLI
+	// rely on when they print Message(err) for a classified failure.
+	if got := Message(e); got != msg {
+		t.Fatalf("Message mangled a cloak error:\n got %q\nwant %q", got, msg)
+	}
+}
+
+// assertAlarmWording pins the escalation contract: the distinctive alarm wording
+// survives into operator-visible output no matter what host-influenced text the
+// Op/Err/Hint carry. Asserted on Message (the real production consumer) against
+// the literal substrings the security suite greps for.
+func assertAlarmWording(t *testing.T, kind Kind, e *Error, msg string) {
+	t.Helper()
+
+	switch kind {
+	case Tamper:
+		if !strings.Contains(Message(e), "TAMPER ALARM") {
+			t.Fatalf("Tamper error dropped the alarm wording: %q", msg)
+		}
+	case Rollback:
+		if !strings.Contains(Message(e), "ROLLBACK ALARM") {
+			t.Fatalf("Rollback error dropped the alarm wording: %q", msg)
+		}
+	}
+}
+
+// assertHostContextFaithful pins that non-empty Op/Err/Hint each appear verbatim
+// in the message (appended, never truncated or escaped), so a hostile host
+// cannot make cloak silently swallow the failure detail.
+func assertHostContextFaithful(t *testing.T, op, errText string, hasErr bool, hint, msg string) {
+	t.Helper()
+
+	if op != "" && !strings.Contains(msg, op) {
+		t.Fatalf("Op not present in message: op=%q msg=%q", op, msg)
+	}
+	if hasErr && errText != "" && !strings.Contains(msg, errText) {
+		t.Fatalf("Err text not present in message: err=%q msg=%q", errText, msg)
+	}
+	// The hint is appended last, so when present it is exactly the message
+	// suffix. A Contains check would false-positive when host-influenced
+	// Op/Err text happens to embed the "\n  hint: " sequence; HasSuffix
+	// pins the real structural contract instead.
+	if hint != "" && !strings.HasSuffix(msg, "\n  hint: "+hint) {
+		t.Fatalf("Hint line missing or malformed: hint=%q msg=%q", hint, msg)
+	}
 }
 
 // FuzzMessagePrefix drives Message over arbitrary plain-error text (the
