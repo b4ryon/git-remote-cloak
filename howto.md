@@ -30,9 +30,13 @@ git cloak keygen
 git cloak key export
 ```
 
-   Use one master key per remote. Never reuse a key across two cloak
-   remotes: the encrypted state carries no repo identity, so a host could
-   serve one repo's state for the other and your machines would accept it.
+   A single master key can safely serve multiple cloak remotes: each remote
+   mints a random repository identity at first push, bound inside the AEAD
+   manifest and pinned locally (trust-on-first-use), so a host that serves a
+   different repository's state under the same key is refused as a hard error
+   (override deliberately with `git cloak accept-repo-change`). Using a
+   separate key per remote is still a reasonable defense-in-depth choice, as
+   it limits the blast radius if one key is exposed.
 
 2. Create an empty private repo on your host (no README), then point your
    repo at it with the cloak:: scheme and push:

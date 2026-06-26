@@ -31,7 +31,10 @@ trusted machines that hold the key:
 - Source you want host-side features on (CI, pull requests, blame, code
   search), the host sees only ciphertext; use a normal private repo.
 - Large or binary-heavy repos, they work, but inefficiently (whole-pack
-  ciphertext, no host-side dedup or partial fetch, no git-LFS).
+  ciphertext, no host-side dedup or partial fetch, no git-LFS). Host file-size
+  limits apply to the encrypted packs: GitHub, for example, rejects any pushed
+  file over 100 MB and caps a single push at ~2 GB, so a pack exceeding those
+  will fail to push.
 - Many users needing differentiated access, one shared key, no per-user ACLs.
 - Hiding traffic rather than content, repo existence, owner, push timing, and
   pack sizes/counts still leak.
@@ -79,7 +82,7 @@ shell:
 
 ```
 export PATH="$HOME/bin:$PATH"  # put this in ~/.zshrc / ~/.bashrc, then open a NEW shell
-git cloak version              # verify the CLI: prints v0.2.3
+git cloak version              # verify the CLI: prints e.g. "git-cloak v0.2.3"
 command -v git-remote-cloak    # verify git can find the helper for cloak:: URLs
                                # (must print a path; if empty, the PATH is wrong)
 ```
