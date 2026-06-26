@@ -200,10 +200,9 @@ func (e *Engine) commitAndExecute(cur *RemoteState, plan *pushPlan, squash bool,
 // repo id, and (when markApplied and a pack was added) the new pack as already
 // applied. Called only after the backend reports backend.PushOK.
 func (e *Engine) persistPushed(gen uint64, hash, repoID, packID string, markApplied bool) error {
-	if err := e.St.SavePin(state.Pin{Generation: gen, ManifestHash: hash}); err != nil {
-		return err
-	}
-	if err := e.St.SaveRepoID(repoID); err != nil {
+	// Persist both pins together (see state.SavePins): a partial save must not
+	// leave a generation pin without its repo-id pin.
+	if err := e.St.SavePins(state.Pin{Generation: gen, ManifestHash: hash}, repoID); err != nil {
 		return err
 	}
 	if markApplied && packID != "" {
@@ -603,6 +602,18 @@ func (e *Engine) treePackBlobs(in commitInput) (map[string]string, error) {
 			return nil, err
 		}
 		packOIDs[in.packID] = oid
+	}
+	// Every pack the manifest declares live must have a blob in the tree we are
+	// about to publish. PackBlobOIDs reuses only blobs the host's current tree
+	// actually carries, so a host that dropped (or never stored) a live pack's
+	// blob would otherwise let us publish a fresh, authenticated manifest that
+	// references a pack with no backing blob -- an inconsistency that only
+	// surfaces later as a fetch failure on every client. Refuse at push instead.
+	for id := range in.man.PackIDs() {
+		if _, ok := packOIDs[id]; !ok {
+			return nil, cloakerr.Newf(cloakerr.Tamper, "assemble pack tree",
+				"manifest declares pack %.12s live but the remote has no blob for it (the host dropped or never stored it); refusing to publish an incomplete state", id)
+		}
 	}
 	return packOIDs, nil
 }

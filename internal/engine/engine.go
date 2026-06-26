@@ -128,10 +128,10 @@ func (e *Engine) CommitPin(rs *RemoteState) error {
 	if rs == nil || rs.Manifest == nil {
 		return nil
 	}
-	if err := e.St.SavePin(state.Pin{Generation: rs.Manifest.Generation, ManifestHash: rs.ManifestHash}); err != nil {
-		return err
-	}
-	return e.St.SaveRepoID(rs.Manifest.RepoID)
+	// Persist both pins together so a partial save can never leave a generation
+	// pin without its repo-id pin (which would silently revert repo-identity
+	// protection to TOFU); see state.SavePins.
+	return e.St.SavePins(state.Pin{Generation: rs.Manifest.Generation, ManifestHash: rs.ManifestHash}, rs.Manifest.RepoID)
 }
 
 // HaveObject reports whether the local repository has the object.

@@ -108,6 +108,59 @@ func corruptStatePins(t *testing.T, c *harness.Client) {
 	}
 }
 
+// solePinPath returns the single rollback pin file in the client's per-remote
+// state directories, failing if there is not exactly one.
+func solePinPath(t *testing.T, c *harness.Client) string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(c.Dir, ".git", "cloak", "*", "generation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 1 {
+		t.Fatalf("expected exactly one pin file, found %d: %v", len(m), m)
+	}
+	return m[0]
+}
+
+// TestAcceptRollbackRestoresPinWhenRevalidationFails proves accept-rollback does
+// not leave the remote unprotected (reverted to TOFU) when its post-clear
+// re-validation fails: it clears the pin, fails to re-load a corrupted remote,
+// and restores the original pin. Without the restore the failed accept would
+// silently drop rollback protection.
+func TestAcceptRollbackRestoresPinWhenRevalidationFails(t *testing.T) {
+	host, key, a := pushSetup(t)
+	a.WriteFile("more.md", "second push\n")
+	a.Commit("c1")
+	a.MustGit("push", "origin", "main")
+
+	b := harness.NewClient(t, "b", key)
+	b.MustClone(host.Dir)
+
+	// The pin the clone established (TOFU); capture its exact bytes.
+	pinPath := solePinPath(t, b)
+	orig, err := os.ReadFile(pinPath)
+	if err != nil || len(orig) == 0 {
+		t.Fatalf("no rollback pin after clone: %v", err)
+	}
+
+	// Corrupt the host manifest so accept-rollback's re-validation (LoadRemote ->
+	// manifest decrypt) fails AFTER it has cleared the pin, exercising restore.
+	garbage := host.HashObjectStdin(t, []byte("not a valid manifest"))
+	host.ReplaceTreeEntry(t, "cloak", "manifest.age", garbage)
+
+	if _, errb, cerr := b.Cloak("accept-rollback", "--remote", "origin"); cerr == nil {
+		t.Fatalf("accept-rollback unexpectedly succeeded against a corrupt remote: %s", errb)
+	}
+
+	got, err := os.ReadFile(pinPath)
+	if err != nil {
+		t.Fatalf("rollback pin was not restored after the failed accept-rollback: %v", err)
+	}
+	if !bytes.Equal(got, orig) {
+		t.Fatalf("restored pin %q does not match the original %q", got, orig)
+	}
+}
+
 // TestInterruptedPersistSelfHeals proves the crash-safety property the atomic
 // state writes exist to guarantee: an interrupted push that committed the
 // backend but never landed its local pin update (a crash between the backend

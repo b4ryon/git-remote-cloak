@@ -54,7 +54,17 @@ func Open(gitCommonDir, remoteName, url string) (*Dir, error) {
 		hashed := filepath.Join(base, DirName("", url))
 		if _, err := os.Stat(root); os.IsNotExist(err) {
 			if _, err := os.Stat(hashed); err == nil {
-				_ = os.Rename(hashed, root)
+				if err := os.Rename(hashed, root); err != nil {
+					// A discarded rename failure would silently abandon the old
+					// dir's TOFU pin and applied set, downgrading the remote to
+					// trust-on-first-use without telling anyone. Tolerate only the
+					// benign race where another process already created root;
+					// surface any other failure instead of proceeding onto a fresh
+					// empty state dir.
+					if _, statErr := os.Stat(root); statErr != nil {
+						return nil, fmt.Errorf("adopt url-hash state dir %q -> %q: %w", hashed, root, err)
+					}
+				}
 			}
 		}
 	}
@@ -213,6 +223,40 @@ func (d *Dir) LoadPin() (Pin, bool, error) {
 // SavePin atomically persists the pin.
 func (d *Dir) SavePin(p Pin) error {
 	return d.writeStateFile("pin", pinFile, []byte(fmt.Sprintf("%d %s\n", p.Generation, p.ManifestHash)))
+}
+
+// SavePins advances the rollback pin and the repo-id pin together. It
+// fsync-writes BOTH temp files before renaming EITHER into place, so the
+// realistic failure (an error writing the second record, e.g. a full disk)
+// leaves both prior pins untouched rather than persisting a generation pin
+// without its repo-id pin -- a half-written state that would silently drop
+// repo-identity protection to trust-on-first-use while rollback protection
+// stayed enforced (CheckRepoID accepts a missing pin as TOFU; CheckPin still
+// enforces). The two renames are adjacent metadata ops on the same directory;
+// a crash strictly between them is still possible (closing that fully would
+// need a single combined pin file, i.e. an on-disk format change), but the
+// window shrinks from the second file's write+rename to between two renames.
+// On-disk layout is unchanged: the same generation and repoid files with
+// serialization byte-identical to SavePin/SaveRepoID.
+func (d *Dir) SavePins(p Pin, repoID string) error {
+	pinTmp := filepath.Join(d.TmpDir(), "pin")
+	ridTmp := filepath.Join(d.TmpDir(), "repoid")
+	if err := writeFileSync(pinTmp, []byte(fmt.Sprintf("%d %s\n", p.Generation, p.ManifestHash)), 0o600); err != nil {
+		return fmt.Errorf("write state file %q: %w", pinFile, err)
+	}
+	if err := writeFileSync(ridTmp, []byte(repoID+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write state file %q: %w", repoIDFile, err)
+	}
+	if err := os.Rename(pinTmp, filepath.Join(d.Root, pinFile)); err != nil {
+		return fmt.Errorf("write state file %q: %w", pinFile, err)
+	}
+	if err := os.Rename(ridTmp, filepath.Join(d.Root, repoIDFile)); err != nil {
+		return fmt.Errorf("write state file %q: %w", repoIDFile, err)
+	}
+	if err := syncDir(d.Root); err != nil {
+		return fmt.Errorf("write state file %q: %w", pinFile, err)
+	}
+	return nil
 }
 
 // CheckPin enforces rollback protection for a validated remote manifest:

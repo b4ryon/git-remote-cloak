@@ -154,17 +154,43 @@ func runAccept(spec acceptSpec, args []string, stdout, stderr io.Writer) int {
 	defer sess.Close()
 
 	spec.describe(sess)
+
+	// Snapshot the records about to be cleared so a later failure restores them
+	// instead of leaving the remote unprotected (reverted to TOFU). Accept must
+	// clear BEFORE re-validating -- LoadRemote runs CheckPin/CheckRepoID, which
+	// would otherwise reject the very rollback or repo-change being accepted --
+	// so the safety net is restore-on-failure, not validate-first. Only a
+	// cleanly-readable prior record is restored: a corrupt pin is exactly what
+	// accept exists to discard. Restore is best-effort; if it fails the fallback
+	// is the (cleared) TOFU state, i.e. the prior behavior, and the primary
+	// error is still reported.
+	prevPin, hadPin, _ := sess.St.LoadPin()
+	prevRepoID, hadRepoID, _ := sess.St.LoadRepoID()
+	restore := func() {
+		if hadPin {
+			_ = sess.St.SavePin(prevPin)
+		}
+		if hadRepoID {
+			_ = sess.St.SaveRepoID(prevRepoID)
+		}
+	}
+
 	if err := spec.clear(sess); err != nil {
 		return cliFailLogged(stderr, sess, err)
 	}
 	if err := sess.LoadRemote(); err != nil {
+		restore()
 		return cliFailLogged(stderr, sess, fmt.Errorf("%s cleared, but re-validating the remote failed: %w", spec.noun, err))
 	}
 	if sess.RS.Manifest == nil {
+		// The remote really is empty: leave the pin cleared (restoring it would
+		// re-raise the "empty but generation N seen" rollback alarm). Next push
+		// recreates and re-pins.
 		fmt.Fprintln(stdout, "Accepted: remote is currently empty; next push recreates it.")
 		return 0
 	}
 	if err := sess.Eng.CommitPin(sess.RS); err != nil {
+		restore()
 		return cliFailLogged(stderr, sess, fmt.Errorf("%s cleared, but %s: %w", spec.noun, spec.repinFail, err))
 	}
 	spec.accepted(sess)
