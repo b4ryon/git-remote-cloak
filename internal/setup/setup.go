@@ -218,5 +218,13 @@ func wireSession(g *gitx.G, cfg config.Config, key keystore.Key, p sessionPaths,
 		G: g, LocalGitDir: p.localGitDir, St: st, Be: be,
 		Key: key, Cfg: cfg, Log: s.Log,
 	}
+	// Reap any of cloak's own leftover pack .keep lock files now that the engine
+	// and the per-remote lock are both in place. git can clean only one pack
+	// lock per fetch, so multi-pack fetches (notably clones) leave orphan .keep
+	// files that would otherwise pin those packs against gc/repack forever; this
+	// removes the ones whose objects are now reachable from refs. Best-effort and
+	// fail-safe: it never fails the session and touches nothing it cannot prove
+	// safe (see engine.ReapOrphanKeeps).
+	s.Eng.ReapOrphanKeeps()
 	return s, nil
 }
