@@ -141,7 +141,7 @@ func FuzzPackObjectIDs(f *testing.F) {
 	f.Fuzz(func(t *testing.T, out string) {
 		ids := packObjectIDs(out)
 		for _, id := range ids {
-			if !packOIDRe.MatchString(id) {
+			if !isLowerHex(id, 40) {
 				t.Fatalf("returned non-oid %q", id)
 			}
 		}

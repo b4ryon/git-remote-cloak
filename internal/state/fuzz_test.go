@@ -94,7 +94,7 @@ func FuzzDirName(f *testing.F) {
 		// Verbatim-or-hash dichotomy: the name is returned verbatim only when
 		// it passes the safe-name gate, otherwise it is the url- hash fallback.
 		if name == remoteName {
-			if !safeName.MatchString(remoteName) {
+			if !isSafeName(remoteName) {
 				t.Fatalf("DirName(%q, %q) returned the name verbatim but it fails the safe-name gate", remoteName, url)
 			}
 		} else if !strings.HasPrefix(name, "url-") {

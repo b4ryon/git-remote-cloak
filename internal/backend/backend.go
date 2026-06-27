@@ -418,8 +418,44 @@ func (b *Backend) push(commit, lease string) (PushResult, error) {
 		b.log.Info("backend push lost compare-and-swap", "marker", marker)
 		return PushCASLost, nil
 	default:
-		return PushFailed, gitx.ClassifyTransport("push backend branch", err)
+		return PushFailed, classifyPushFailure(stdout, stderr, err)
 	}
+}
+
+// hostFileLimitMarkers are substrings a host prints when it refuses a push
+// because a file (one encrypted pack blob) exceeds its per-file size cap. The
+// combined push output is lowercased before matching, so these are written in
+// lower case. Plain substrings, not a regex (mirroring casLostMarkers below):
+// each is a fixed phrase. GitHub prints "GH001: Large files detected" and
+// "exceeds GitHub's file size limit of 100.00 MB"; git's own receive.maxInputSize
+// guard prints "pack exceeds maximum allowed size".
+var hostFileLimitMarkers = []string{
+	"file size limit",
+	"gh001",
+	"large files detected",
+	"large file detected",
+	"maximum allowed size",
+}
+
+// classifyPushFailure maps a failed (non-CAS) backend push to its taxonomy. A
+// host file-size rejection is the host-side counterpart to the pre-flight
+// cloak.maxPackBytes guard (which catches the common case before upload): when
+// the configured limit is unset or larger than the host's real cap, the push
+// reaches the host and is rejected here, so this turns that rejection into a
+// clear TooLarge error instead of a generic local-git failure. Every other
+// failure falls through to the transport classifier. Matching the host's
+// "remote:" sideband is safe here: the worst a hostile host can do is mislabel
+// its own push rejection as "too large", which leaks nothing and (unlike the
+// integrity read path) cannot downgrade a security class.
+func classifyPushFailure(stdout, stderr string, err error) error {
+	combined := strings.ToLower(stdout + "\n" + stderr)
+	for _, m := range hostFileLimitMarkers {
+		if strings.Contains(combined, m) {
+			return cloakerr.New(cloakerr.TooLarge, "push backend branch", err).WithHint(
+				"the host refused the push because an encrypted pack exceeds its per-file size limit (GitHub: 100 MiB); cloak stores each pack as one file, so shrink or remove the large file(s) and re-commit, or set `git config cloak.maxPackBytes` to catch this before upload")
+		}
+	}
+	return gitx.ClassifyTransport("push backend branch", err)
 }
 
 // casLostMarkers are the substrings git prints (to stdout or stderr) when a push

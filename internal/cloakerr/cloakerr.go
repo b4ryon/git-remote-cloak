@@ -43,6 +43,11 @@ const (
 	// Distinct from Tamper: AEAD already verified the bytes, so this is a
 	// version/format problem, not an attack.
 	Protocol
+	// TooLarge: an encrypted pack would exceed the host's per-file size limit
+	// (cloak stores each pack as a single file). Raised pre-flight from the
+	// configured cloak.maxPackBytes, or from the host's own rejection. Not an
+	// attack and not retryable; the user must shrink what they push.
+	TooLarge
 )
 
 // kindInfo holds the per-Kind reporting strings, indexed by Kind so the two
@@ -64,6 +69,7 @@ var kindInfo = [...]struct {
 	KeyUnavailable: {"key-unavailable", "cloak: master key unavailable"},
 	Crypto:         {"crypto", "cloak: cryptographic failure"},
 	Protocol:       {"protocol", "cloak: incompatible remote"},
+	TooLarge:       {"too-large", "cloak: pack too large for host"},
 }
 
 func (k Kind) String() string {

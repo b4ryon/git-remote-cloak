@@ -285,8 +285,12 @@ func (e *Engine) repackPack(cur *RemoteState, key keystore.Key) (*agecrypt.PackW
 	if _, err := e.FetchApply(cur); err != nil {
 		return nil, err
 	}
-	var wants strings.Builder
+	wantList := make([]string, 0, len(cur.Manifest.Refs))
 	for _, oid := range cur.Manifest.Refs {
+		wantList = append(wantList, oid)
+	}
+	var wants strings.Builder
+	for _, oid := range wantList {
 		fmt.Fprintln(&wants, oid)
 	}
 	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), key)
@@ -297,6 +301,13 @@ func (e *Engine) repackPack(cur *RemoteState, key keystore.Key) (*agecrypt.PackW
 		Stdin: strings.NewReader(wants.String()), Stdout: pw},
 		"pack reachable objects", "finalize repack pack",
 		"--revs", "--stdout", "--delta-base-offset"); err != nil {
+		return nil, err
+	}
+	// A repack squashes the whole repo into one pack; refuse before upload if it
+	// would not fit the host's per-file limit (no split can help a single pack).
+	// streamPack left the ciphertext temp file, so remove it on refusal.
+	if err := e.checkPackLimit("repack", pw.Size(), wantList, nil); err != nil {
+		_ = os.Remove(pw.Path())
 		return nil, err
 	}
 	return pw, nil

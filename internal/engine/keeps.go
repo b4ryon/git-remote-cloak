@@ -14,7 +14,6 @@ package engine
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
@@ -26,9 +25,21 @@ import (
 // is never touched.
 const keepMessage = "cloak"
 
-// packOIDRe matches a git object id as it appears in git show-index output
-// (lowercase 40-hex, sha1; non-sha1 repos are rejected at setup).
-var packOIDRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
+// isLowerHex reports whether s is exactly n lowercase hex digits ([0-9a-f]) -
+// the shape of a git object id (40 chars, sha1; non-sha1 repos are rejected at
+// setup) as it appears in show-index / rev-list output. Exact non-regex
+// equivalent of `^[0-9a-f]{n}$` (lowercase only, whole string).
+func isLowerHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // ReapOrphanKeeps removes cloak's leftover pack .keep lock files whose pack
 // objects are now reachable from refs. It is best-effort session hygiene: it
@@ -153,7 +164,7 @@ func packObjectIDs(showIndexOut string) []string {
 	var ids []string
 	for _, line := range strings.Split(showIndexOut, "\n") {
 		for _, f := range strings.Fields(line) {
-			if packOIDRe.MatchString(f) {
+			if isLowerHex(f, 40) {
 				ids = append(ids, f)
 				break
 			}

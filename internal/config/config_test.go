@@ -42,6 +42,7 @@ func TestLoadOverrides(t *testing.T) {
 		"cloak.pushRetries":     "9",
 		"cloak.branch":          "vault",
 		"cloak.logLevel":        "debug",
+		"cloak.maxPackBytes":    "2097152",
 	} {
 		if out, err := exec.Command("git", "--git-dir", gitDir, "config", k, v).CombinedOutput(); err != nil {
 			t.Fatalf("config %s: %v\n%s", k, err, out)
@@ -53,7 +54,7 @@ func TestLoadOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.KeyRef != "file:/x/key" || c.GeometricFactor != 3 || c.PushRetries != 9 ||
-		c.Branch != "vault" || c.LogLevel != "debug" {
+		c.Branch != "vault" || c.LogLevel != "debug" || c.MaxPackBytes != 2097152 {
 		t.Fatalf("overrides not applied: %+v", c)
 	}
 }
@@ -63,6 +64,7 @@ func TestBadValuesKeepDefaults(t *testing.T) {
 	for k, v := range map[string]string{
 		"cloak.geometricFactor": "-1",
 		"cloak.pushRetries":     "zero",
+		"cloak.maxPackBytes":    "-5", // below min 0
 	} {
 		if out, err := exec.Command("git", "--git-dir", gitDir, "config", k, v).CombinedOutput(); err != nil {
 			t.Fatalf("config %s: %v\n%s", k, err, out)
@@ -73,7 +75,8 @@ func TestBadValuesKeepDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.GeometricFactor != Defaults().GeometricFactor || c.PushRetries != Defaults().PushRetries {
+	if c.GeometricFactor != Defaults().GeometricFactor || c.PushRetries != Defaults().PushRetries ||
+		c.MaxPackBytes != Defaults().MaxPackBytes {
 		t.Fatalf("bad values overrode defaults: %+v", c)
 	}
 }
