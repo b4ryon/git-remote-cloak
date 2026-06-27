@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 
@@ -20,7 +19,25 @@ import (
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 )
 
-var safeName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+// isSafeName reports whether s is a non-empty string of only [A-Za-z0-9._-],
+// the character whitelist for using a remote name directly as a state dir name
+// (anything else is hashed instead). Exact non-regex equivalent of
+// `^[A-Za-z0-9._-]+$`.
+func isSafeName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == '-':
+			// allowed
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // DirName returns the state directory name for a helper invocation:
 // the remote name when git passed one, else a hash of the URL. "." and
@@ -29,7 +46,7 @@ var safeName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 // directly), so they fall through to the URL hash.
 func DirName(remoteName, url string) string {
 	if remoteName != "" && remoteName != url && remoteName != "." && remoteName != ".." &&
-		safeName.MatchString(remoteName) {
+		isSafeName(remoteName) {
 		return remoteName
 	}
 	sum := sha256.Sum256([]byte(url))

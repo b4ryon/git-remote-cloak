@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -35,11 +34,22 @@ const (
 	maxPacks    = 1 << 14
 )
 
-var (
-	packIDRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	oidRe    = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	repoIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
-)
+// isLowerHex reports whether s is exactly n lowercase hex digits ([0-9a-f]),
+// the fixed shape of cloak's content-addressed identifiers: pack ids (SHA-256,
+// 64 chars), object ids (SHA-1, 40), and the repo id (16 random bytes, 32). It
+// is the exact non-regex equivalent of `^[0-9a-f]{n}$` (lowercase only, whole
+// string), keeping these untrusted-manifest validators off the regexp engine.
+func isLowerHex(s string, n int) bool {
+	if len(s) != n {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // hasAdvertUnsafeByte reports whether s contains an ASCII control character
 // (including newline and carriage return) or a space. The helper builds git's
@@ -163,7 +173,7 @@ func (m *Manifest) validateMeta() error {
 	if m.Version != Version {
 		return fmt.Errorf("manifest: unsupported version %d (this build speaks %d)", m.Version, Version)
 	}
-	if !repoIDRe.MatchString(m.RepoID) {
+	if !isLowerHex(m.RepoID, 32) {
 		return fmt.Errorf("manifest: missing or malformed repo id %q", m.RepoID)
 	}
 	if m.Head != "" && !strings.HasPrefix(m.Head, "refs/heads/") {
@@ -202,7 +212,7 @@ func (m *Manifest) validateRefs() error {
 		if hasAdvertUnsafeByte(name) {
 			return fmt.Errorf("manifest: ref name %q contains a control character or space", name)
 		}
-		if !oidRe.MatchString(oid) {
+		if !isLowerHex(oid, 40) {
 			return fmt.Errorf("manifest: ref %q has malformed object id %q", name, oid)
 		}
 	}
@@ -229,7 +239,7 @@ func (m *Manifest) validatePacks() (map[string]bool, error) {
 // order so a pack failing several rules reports the same error as the inline
 // loop did.
 func validatePack(p Pack, seen map[string]bool) error {
-	if !packIDRe.MatchString(p.ID) {
+	if !isLowerHex(p.ID, 64) {
 		return fmt.Errorf("manifest: malformed pack id %q", p.ID)
 	}
 	if seen[p.ID] {
@@ -260,7 +270,7 @@ func (m *Manifest) validateReplaces(seen map[string]bool) error {
 // and must not name a still-live pack (present in seen).
 func validatePackReplaces(p Pack, seen map[string]bool) error {
 	for _, r := range p.Replaces {
-		if !packIDRe.MatchString(r) {
+		if !isLowerHex(r, 64) {
 			return fmt.Errorf("manifest: pack %q replaces malformed id %q", p.ID, r)
 		}
 		if seen[r] {

@@ -159,6 +159,16 @@ func (e *Engine) maybeConsolidate(cur *RemoteState, plan *pushPlan) (squash bool
 	if len(victims) < 2 {
 		return false, nil
 	}
+	// Skip a consolidation that would merge the victims into an over-limit pack
+	// (predicted from their recorded sizes, no download). Consolidation is an
+	// optimization, so skipping it keeps the user's push working: the victims
+	// stay as separate, still-fitting packs and the incremental pack (already
+	// size-checked) is pushed normally.
+	if e.consolidationWouldExceed(victims) {
+		e.Log.Info("skipping geometric consolidation: merged pack would exceed cloak.maxPackBytes",
+			"victims", len(victims), "predicted_bytes", sumPackSizes(victims), "limit", e.Cfg.MaxPackBytes)
+		return false, nil
+	}
 	if err := e.consolidate(cur, plan, victims); err != nil {
 		return false, err
 	}
@@ -445,6 +455,7 @@ type builtPack struct {
 // object count so empty packs are dropped.
 func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtPack, error) {
 	var stdin strings.Builder
+	haves := make([]string, 0, len(remoteRefs))
 	for _, w := range wants {
 		fmt.Fprintln(&stdin, w)
 	}
@@ -452,6 +463,7 @@ func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtP
 	for _, oid := range remoteRefs {
 		if e.HaveObject(oid) {
 			fmt.Fprintln(&stdin, oid)
+			haves = append(haves, oid)
 		}
 	}
 
@@ -468,6 +480,15 @@ func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtP
 		return builtPack{}, err
 	}
 	e.Log.Info("built pack", "objects", sniff.count(), "ciphertext_bytes", pw.Size())
+	// Refuse before any upload if the new pack would not fit the host's per-file
+	// limit. Only a non-empty pack is checked (an empty pack is discarded by the
+	// caller). streamPack left the ciphertext temp file, so remove it on refusal.
+	if sniff.count() > 0 {
+		if err := e.checkPackLimit("push", pw.Size(), wants, haves); err != nil {
+			_ = os.Remove(pw.Path())
+			return builtPack{}, err
+		}
+	}
 	return builtPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), count: sniff.count()}, nil
 }
 

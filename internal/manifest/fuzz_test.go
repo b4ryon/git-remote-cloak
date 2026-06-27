@@ -437,7 +437,7 @@ func assertPackSetRoundTrip(t *testing.T, enc []byte) {
 // gate: a guaranteed-valid 32-hex id (mode 0), an arbitrary string (mode 1,
 // almost always rejected), the empty/missing case (mode 2, the v0-style absence
 // the gate exists to reject), and a valid-charset-but-wrong-length near-miss
-// (mode 3) that exercises repoIDRe's length anchor.
+// (mode 3) that exercises the repo-id length check (isLowerHex(_, 32)).
 func metaRepoID(mode uint8, raw string) string {
 	switch mode % 4 {
 	case 0:
@@ -452,7 +452,7 @@ func metaRepoID(mode uint8, raw string) string {
 }
 
 // validRepoHex returns exactly 32 lowercase hex chars derived from raw
-// (zero-padded/truncated to 16 bytes), so it always satisfies repoIDRe.
+// (zero-padded/truncated to 16 bytes), so it always satisfies the repo-id check.
 func validRepoHex(raw string) string {
 	b := make([]byte, 16)
 	copy(b, raw)
@@ -476,10 +476,10 @@ func metaHead(mode uint8, raw string) string {
 	}
 }
 
-// isHex32 reports whether s is exactly 32 lowercase hex chars. It is a
-// char-by-char restatement of the production repoIDRe (^[0-9a-f]{32}$) by a
-// deliberately different decomposition (a length check plus a byte loop, not a
-// regexp), so the oracle catches a regexp drift rather than mirroring it.
+// isHex32 reports whether s is exactly 32 lowercase hex chars. It is an
+// independently written restatement of the production repo-id check (manifest's
+// isLowerHex(_, 32), i.e. ^[0-9a-f]{32}$), kept as a separate copy so the oracle
+// catches a drift in that check rather than reusing (and so mirroring) its code.
 func isHex32(s string) bool {
 	if len(s) != 32 {
 		return false
@@ -564,7 +564,7 @@ func FuzzValidateMeta(f *testing.F) {
 		}
 
 		// Independently re-derive meta validity. isHex32 is a length+byte-loop
-		// restatement of repoIDRe (a different decomposition), and metaHeadValid
+		// restatement of the repo-id check (isLowerHex(_, 32)), and metaHeadValid
 		// restates the head contract; with refs empty and packs nil these are the
 		// exact and only conditions under which Validate (hence Encode) accepts.
 		metaOK := version == Version && isHex32(rid) && metaHeadValid(head)
@@ -619,7 +619,7 @@ func refName(mode uint8, raw string) string {
 // refOID builds an object id reaching both sides of validateRefs's oid gate: a
 // guaranteed-valid 40-hex id derived from raw (mode 0), an arbitrary string
 // (mode 1, almost always rejected), and a valid-charset-but-wrong-length
-// near-miss (mode 2) that exercises oidRe's {40} length anchor.
+// near-miss (mode 2) that exercises the object-id length check (isLowerHex(_, 40)).
 func refOID(mode uint8, raw string) string {
 	switch mode % 3 {
 	case 0:
@@ -632,7 +632,7 @@ func refOID(mode uint8, raw string) string {
 }
 
 // validOIDHex returns exactly 40 lowercase hex chars derived from raw
-// (zero-padded/truncated to 20 bytes), so it always satisfies oidRe.
+// (zero-padded/truncated to 20 bytes), so it always satisfies the object-id check.
 func validOIDHex(raw string) string {
 	b := make([]byte, 20)
 	copy(b, raw)
@@ -657,10 +657,10 @@ func refNameValid(name string) bool {
 	return true
 }
 
-// isHex40 reports whether s is exactly 40 lowercase hex chars. It is a
-// char-by-char restatement of the production oidRe (^[0-9a-f]{40}$) by a
-// deliberately different decomposition (a length check plus a byte loop, not a
-// regexp), so the oracle catches a regexp drift rather than mirroring it.
+// isHex40 reports whether s is exactly 40 lowercase hex chars. It is an
+// independently written restatement of the production object-id check (manifest's
+// isLowerHex(_, 40), i.e. ^[0-9a-f]{40}$), kept as a separate copy so the oracle
+// catches a drift in that check rather than reusing (and so mirroring) its code.
 func isHex40(s string) bool {
 	if len(s) != 40 {
 		return false
@@ -689,7 +689,7 @@ func isHex40(s string) bool {
 // validateRefs is the ONLY phase that can reject, so Validate accepts IFF every
 // ref in the map has a valid name and a valid oid; the oracle re-derives that
 // independently (refNameValid restating the name contract, isHex40 restating
-// oidRe by a different decomposition) and asserts the biconditional over a
+// the object-id check isLowerHex(_, 40)) and asserts the biconditional over a
 // two-ref map, which also exercises the per-ref conjunction and the
 // map-iteration-order independence of the decision.
 func FuzzValidateRefs(f *testing.F) {
@@ -889,11 +889,10 @@ func injectField(t *testing.T, base []byte, field string, value json.RawMessage,
 	return doc
 }
 
-// isHex64 reports whether s is exactly 64 lowercase hex chars. It is a
-// char-by-char restatement of the production packIDRe (^[0-9a-f]{64}$) by a
-// deliberately different decomposition (a length check plus a byte loop, not a
-// regexp), mirroring isHex32/isHex40, so the oracle catches a packIDRe drift
-// rather than mirroring it.
+// isHex64 reports whether s is exactly 64 lowercase hex chars. It is an
+// independently written restatement of the production pack-id check (manifest's
+// isLowerHex(_, 64), i.e. ^[0-9a-f]{64}$), kept as a separate copy (like
+// isHex32/isHex40) so the oracle catches a drift in that check.
 func isHex64(s string) bool {
 	if len(s) != 64 {
 		return false
@@ -928,7 +927,7 @@ func FuzzValidatePackIDs(f *testing.F) {
 	other := strings.Repeat("b", 64)
 	f.Add(valid, "", false)                     // well-formed id, no replaces: accept
 	f.Add("xyz", "", false)                     // too-short id: reject
-	f.Add(strings.Repeat("A", 64), "", false)   // uppercase hex: reject (packIDRe is lowercase)
+	f.Add(strings.Repeat("A", 64), "", false)   // uppercase hex: reject (the pack-id check is lowercase-only)
 	f.Add("", "", false)                        // empty id: reject
 	f.Add(valid, other, true)                   // both well-formed, distinct: accept
 	f.Add(valid, "deadbeef", true)              // malformed replaces id: reject
@@ -954,7 +953,7 @@ func FuzzValidatePackIDs(f *testing.F) {
 		// range, so the ONLY rejection causes are: a malformed pack id, or (when a
 		// Replaces entry is present) a malformed Replaces id, or a Replaces entry
 		// naming the one live pack (id-vs-replaces overlap). isHex64 is an
-		// independent restatement of packIDRe. A malformed pack id is checked
+		// independent restatement of the pack-id check. A malformed pack id is checked
 		// first (validatePack runs before validateReplaces), so it shields the
 		// Replaces check; for accept/reject that ordering is irrelevant -- the
 		// manifest is rejected iff some violation exists.

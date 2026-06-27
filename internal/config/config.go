@@ -23,6 +23,10 @@ type Config struct {
 	Branch string
 	// LogLevel is the per-repo file log level (CLOAK_LOG env overrides).
 	LogLevel string
+	// MaxPackBytes is the largest encrypted pack (one host file) cloak will
+	// publish; a build that would exceed it is refused before upload. 0 disables
+	// the check. Defaults to GitHub's per-file hard cap (100 MiB).
+	MaxPackBytes int64
 }
 
 // Defaults returns the documented default configuration.
@@ -33,6 +37,7 @@ func Defaults() Config {
 		PushRetries:     5,
 		Branch:          "cloak",
 		LogLevel:        "info",
+		MaxPackBytes:    100 << 20, // 100 MiB: GitHub's per-file hard cap
 	}
 }
 
@@ -96,6 +101,8 @@ func applyConfigSetting(c *Config, key, val string) {
 		}
 	case "cloak.loglevel":
 		c.LogLevel = val
+	case "cloak.maxpackbytes":
+		setIfValidInt64(&c.MaxPackBytes, val, 0)
 	}
 }
 
@@ -103,6 +110,16 @@ func applyConfigSetting(c *Config, key, val string) {
 // when it parses and is at least min, leaving the existing default otherwise.
 func setIfValidInt(dst *int, val string, min int) {
 	if n, err := strconv.Atoi(val); err == nil && n >= min {
+		*dst = n
+	}
+}
+
+// setIfValidInt64 parses val as a base-10 int64 and stores it in *dst only when
+// it parses and is at least min, leaving the existing default otherwise. The
+// int64 sibling of setIfValidInt, for byte-count settings whose values exceed
+// the int range on 32-bit platforms.
+func setIfValidInt64(dst *int64, val string, min int64) {
+	if n, err := strconv.ParseInt(val, 10, 64); err == nil && n >= min {
 		*dst = n
 	}
 }

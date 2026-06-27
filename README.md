@@ -34,7 +34,8 @@ trusted machines that hold the key:
   ciphertext, no host-side dedup or partial fetch, no git-LFS). Host file-size
   limits apply to the encrypted packs: GitHub, for example, rejects any pushed
   file over 100 MB and caps a single push at ~2 GB, so a pack exceeding those
-  will fail to push.
+  will fail to push. cloak catches the per-file case before upload and refuses
+  with the offending file named (`cloak.maxPackBytes`, default 100 MiB).
 - Many users needing differentiated access, one shared key, no per-user ACLs.
 - Hiding traffic rather than content, repo existence, owner, push timing, and
   pack sizes/counts still leak.
@@ -82,7 +83,7 @@ shell:
 
 ```
 export PATH="$HOME/bin:$PATH"  # put this in ~/.zshrc / ~/.bashrc, then open a NEW shell
-git cloak version              # verify the CLI: prints e.g. "git-cloak v0.2.4"
+git cloak version              # verify the CLI: prints e.g. "git-cloak v0.2.5"
 command -v git-remote-cloak    # verify git can find the helper for cloak:: URLs
                                # (must print a path; if empty, the PATH is wrong)
 ```
@@ -93,7 +94,7 @@ later `git clone cloak::...` fails with "helper not found". The full end-to-end
 check is a `cloak::` clone (or `git ls-remote cloak::<your-host>`) once you have
 a key and a host repo configured.
 
-Alternative: `go install github.com/b4ryon/git-remote-cloak/cmd/git-remote-cloak@v0.2.4`,
+Alternative: `go install github.com/b4ryon/git-remote-cloak/cmd/git-remote-cloak@v0.2.5`,
 then `ln -sf git-remote-cloak "$(go env GOPATH)/bin/git-cloak"`.
 
 ### First repository
@@ -182,6 +183,14 @@ git config (`cloak.*`):
 - `geometricFactor`, pack-consolidation aggressiveness (default 2; `0` disables).
 - `pushRetries`, compare-and-swap retry budget under concurrent pushes (default 5).
 - `branch`, the backend branch name on the host (default `cloak`).
+- `maxPackBytes`, the largest encrypted pack (one host file) cloak will publish.
+  A push or repack that would exceed it is refused *before upload*, naming the
+  largest files so you know what to shrink, and leaving no partial upload.
+  Default `104857600` (100 MiB, GitHub's per-file hard cap); set `0` to disable
+  (a self-hosted host with no limit), or raise it for a host with a higher cap.
+  A consolidation that would cross the limit is skipped rather than failing the
+  push. If the limit is left unset/too high and the host rejects the push, cloak
+  still reports it clearly as a "pack too large for host" error.
 
 Environment: `CLOAK_GIT_TIMEOUT` (git subprocess timeout, default 120s; `0`/`off`
 disables), `CLOAK_LOG` (per-repo debug log level).

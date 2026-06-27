@@ -20,6 +20,7 @@ func TestKindStrings(t *testing.T) {
 		KeyUnavailable: "key-unavailable",
 		Crypto:         "crypto",
 		Protocol:       "protocol",
+		TooLarge:       "too-large",
 		Kind(99):       "kind(99)",
 	}
 	for k, want := range cases {
@@ -41,6 +42,7 @@ func TestErrorPrefixes(t *testing.T) {
 		KeyUnavailable: "cloak: master key unavailable",
 		Crypto:         "cloak: cryptographic failure",
 		Protocol:       "cloak: incompatible remote",
+		TooLarge:       "cloak: pack too large for host",
 		Kind(99):       "cloak: error",
 	}
 	for k, want := range cases {
