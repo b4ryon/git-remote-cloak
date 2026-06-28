@@ -51,24 +51,12 @@ func printManifestStatus(sess *setup.Session, stdout, stderr io.Writer) int {
 	if err != nil {
 		return cliFailLogged(stderr, sess, err)
 	}
-	if pinned {
-		fmt.Fprintf(stdout, "Generation: %d (last verified on this machine: %d, manifest %.12s)\n", m.Generation, pin.Generation, pin.ManifestHash)
-	} else {
-		fmt.Fprintf(stdout, "Generation: %d (nothing verified on this machine yet)\n", m.Generation)
-	}
+	printGenerationLine(stdout, m, pin, pinned)
 	rid, ridOK, err := sess.St.LoadRepoID()
 	if err != nil {
 		return cliFailLogged(stderr, sess, err)
 	}
-	if ridOK {
-		note := "matches this machine's record"
-		if rid != m.RepoID {
-			note = "DIFFERS from this machine's record"
-		}
-		fmt.Fprintf(stdout, "Repo-ID:    %s (%s)\n", m.RepoID, note)
-	} else {
-		fmt.Fprintf(stdout, "Repo-ID:    %s (no record on this machine yet)\n", m.RepoID)
-	}
+	printRepoIDLine(stdout, m, rid, ridOK)
 	fmt.Fprintf(stdout, "Head:       %s\n", m.Head)
 	fmt.Fprintf(stdout, "Refs:       %d\n", len(m.Refs))
 	fmt.Fprintf(stdout, "Packs:      %d live, %d bytes total (largest %d, smallest %d)\n",
@@ -105,6 +93,30 @@ func countAppliedLive(packs []manifest.Pack, applied map[string]bool) int {
 		}
 	}
 	return n
+}
+
+// printGenerationLine prints the Generation status line, noting this machine's
+// last-verified generation and manifest when a pin exists.
+func printGenerationLine(stdout io.Writer, m *manifest.Manifest, pin state.Pin, pinned bool) {
+	if pinned {
+		fmt.Fprintf(stdout, "Generation: %d (last verified on this machine: %d, manifest %.12s)\n", m.Generation, pin.Generation, pin.ManifestHash)
+	} else {
+		fmt.Fprintf(stdout, "Generation: %d (nothing verified on this machine yet)\n", m.Generation)
+	}
+}
+
+// printRepoIDLine prints the Repo-ID status line, noting whether the remote
+// repo id matches this machine's record.
+func printRepoIDLine(stdout io.Writer, m *manifest.Manifest, rid string, ridOK bool) {
+	if ridOK {
+		note := "matches this machine's record"
+		if rid != m.RepoID {
+			note = "DIFFERS from this machine's record"
+		}
+		fmt.Fprintf(stdout, "Repo-ID:    %s (%s)\n", m.RepoID, note)
+	} else {
+		fmt.Fprintf(stdout, "Repo-ID:    %s (no record on this machine yet)\n", m.RepoID)
+	}
 }
 
 // printSyncState prints the one-line sync verdict comparing the remote
@@ -152,7 +164,14 @@ func runAccept(spec acceptSpec, args []string, stdout, stderr io.Writer) int {
 		return cliFail(stderr, err)
 	}
 	defer sess.Close()
+	return runAcceptOnSession(spec, sess, stdout, stderr)
+}
 
+// runAcceptOnSession runs the protected accept transaction on an already-open
+// session: report what is being discarded, snapshot the local records, clear
+// them, re-validate the remote (restoring on failure so the remote is never
+// left unprotected), and re-pin the current state.
+func runAcceptOnSession(spec acceptSpec, sess *setup.Session, stdout, stderr io.Writer) int {
 	spec.describe(sess)
 
 	// Snapshot the records about to be cleared so a later failure restores them

@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
+	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 )
 
 // keepMessage is the marker cloak writes into every pack .keep it creates (git
@@ -24,22 +25,6 @@ import (
 // files carrying exactly this marker, so a user's manual .keep or another tool's
 // is never touched.
 const keepMessage = "cloak"
-
-// isLowerHex reports whether s is exactly n lowercase hex digits ([0-9a-f]) -
-// the shape of a git object id (40 chars, sha1; non-sha1 repos are rejected at
-// setup) as it appears in show-index / rev-list output. Exact non-regex
-// equivalent of `^[0-9a-f]{n}$` (lowercase only, whole string).
-func isLowerHex(s string, n int) bool {
-	if len(s) != n {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
-}
 
 // ReapOrphanKeeps removes cloak's leftover pack .keep lock files whose pack
 // objects are now reachable from refs. It is best-effort session hygiene: it
@@ -164,7 +149,7 @@ func packObjectIDs(showIndexOut string) []string {
 	var ids []string
 	for _, line := range strings.Split(showIndexOut, "\n") {
 		for _, f := range strings.Fields(line) {
-			if isLowerHex(f, 40) {
+			if manifest.IsLowerHex(f, 40) {
 				ids = append(ids, f)
 				break
 			}

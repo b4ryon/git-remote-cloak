@@ -67,28 +67,42 @@ func Open(gitCommonDir, remoteName, url string) (*Dir, error) {
 	base := filepath.Join(gitCommonDir, "cloak")
 	name := DirName(remoteName, url)
 	root := filepath.Join(base, name)
-	if name != DirName("", url) {
-		hashed := filepath.Join(base, DirName("", url))
-		if _, err := os.Stat(root); os.IsNotExist(err) {
-			if _, err := os.Stat(hashed); err == nil {
-				if err := os.Rename(hashed, root); err != nil {
-					// A discarded rename failure would silently abandon the old
-					// dir's TOFU pin and applied set, downgrading the remote to
-					// trust-on-first-use without telling anyone. Tolerate only the
-					// benign race where another process already created root;
-					// surface any other failure instead of proceeding onto a fresh
-					// empty state dir.
-					if _, statErr := os.Stat(root); statErr != nil {
-						return nil, fmt.Errorf("adopt url-hash state dir %q -> %q: %w", hashed, root, err)
-					}
-				}
-			}
-		}
+	if err := adoptURLHashDir(base, name, root, url); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Join(root, "tmp"), 0o700); err != nil {
 		return nil, err
 	}
 	return &Dir{Root: root}, nil
+}
+
+// adoptURLHashDir renames a pre-existing url-hash state dir into root so the
+// TOFU pin and applied set created by clone (before the remote had a name)
+// survive once the remote is named. It is a no-op unless the remote now has a
+// name (name differs from the url hash), root does not yet exist, and a
+// url-hash dir is present.
+func adoptURLHashDir(base, name, root, url string) error {
+	if name == DirName("", url) {
+		return nil
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		return nil
+	}
+	hashed := filepath.Join(base, DirName("", url))
+	if _, err := os.Stat(hashed); err != nil {
+		return nil
+	}
+	if err := os.Rename(hashed, root); err != nil {
+		// A discarded rename failure would silently abandon the old dir's TOFU
+		// pin and applied set, downgrading the remote to trust-on-first-use
+		// without telling anyone. Tolerate only the benign race where another
+		// process already created root; surface any other failure instead of
+		// proceeding onto a fresh empty state dir.
+		if _, statErr := os.Stat(root); statErr != nil {
+			return fmt.Errorf("adopt url-hash state dir %q -> %q: %w", hashed, root, err)
+		}
+	}
+	return nil
 }
 
 // Lock takes an exclusive flock serializing helper and CLI invocations for

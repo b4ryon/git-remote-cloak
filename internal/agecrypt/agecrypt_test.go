@@ -22,10 +22,14 @@ func testKey(t *testing.T) keystore.Key {
 	return k
 }
 
-func TestRoundTripSizes(t *testing.T) {
-	k := testKey(t)
-	// Sizes straddle the age STREAM 64 KiB chunk boundary.
-	for _, n := range []int{0, 1, 63, 64 * 1024, 64*1024 + 1, 1 << 20} {
+// assertRoundTrip encrypts then decrypts random plaintext of each given size
+// under k and fails if any size does not survive the round trip. The basic and
+// the boundary-sweep round-trip tests (here and in stream_test.go) share this
+// loop, differing only in their complementary size sets; the mismatch message
+// is threaded so each keeps its original failure wording verbatim.
+func assertRoundTrip(t *testing.T, k keystore.Key, sizes []int, mismatch string) {
+	t.Helper()
+	for _, n := range sizes {
 		pt := make([]byte, n)
 		if _, err := rand.Read(pt); err != nil {
 			t.Fatal(err)
@@ -39,9 +43,14 @@ func TestRoundTripSizes(t *testing.T) {
 			t.Fatalf("size %d: decrypt: %v", n, err)
 		}
 		if !bytes.Equal(got, pt) {
-			t.Fatalf("size %d: round trip mismatch", n)
+			t.Fatalf("size %d: %s", n, mismatch)
 		}
 	}
+}
+
+func TestRoundTripSizes(t *testing.T) {
+	// Sizes straddle the age STREAM 64 KiB chunk boundary.
+	assertRoundTrip(t, testKey(t), []int{0, 1, 63, 64 * 1024, 64*1024 + 1, 1 << 20}, "round trip mismatch")
 }
 
 func TestWrongKeyFailsClosed(t *testing.T) {

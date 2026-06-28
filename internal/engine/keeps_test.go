@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/b4ryon/git-remote-cloak/internal/manifest"
 )
 
 // gitBin runs git capturing raw stdout (binary-safe, unlike gitInDir's
@@ -141,7 +143,7 @@ func FuzzPackObjectIDs(f *testing.F) {
 	f.Fuzz(func(t *testing.T, out string) {
 		ids := packObjectIDs(out)
 		for _, id := range ids {
-			if !isLowerHex(id, 40) {
+			if !manifest.IsLowerHex(id, 40) {
 				t.Fatalf("returned non-oid %q", id)
 			}
 		}

@@ -108,18 +108,28 @@ func corruptStatePins(t *testing.T, c *harness.Client) {
 	}
 }
 
+// soleStateFile returns the single per-remote state file named `name` (under the
+// client's .git/cloak/<hash>/ dirs), failing with a `noun`-labeled message if
+// there is not exactly one (the integration clients use a single remote). It
+// keeps its own t.Helper() so a caller that also marks itself a helper still
+// attributes the Fatalf to the test call site.
+func soleStateFile(t *testing.T, c *harness.Client, name, noun string) string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(c.Dir, ".git", "cloak", "*", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one %s, found %d: %v", noun, len(matches), matches)
+	}
+	return matches[0]
+}
+
 // solePinPath returns the single rollback pin file in the client's per-remote
 // state directories, failing if there is not exactly one.
 func solePinPath(t *testing.T, c *harness.Client) string {
 	t.Helper()
-	m, err := filepath.Glob(filepath.Join(c.Dir, ".git", "cloak", "*", "generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(m) != 1 {
-		t.Fatalf("expected exactly one pin file, found %d: %v", len(m), m)
-	}
-	return m[0]
+	return soleStateFile(t, c, "generation", "pin file")
 }
 
 // TestAcceptRollbackRestoresPinWhenRevalidationFails proves accept-rollback does
@@ -303,14 +313,7 @@ func TestFailedFetchLeavesAppliedSetUnadvanced(t *testing.T) {
 // remote).
 func appliedFilePath(t *testing.T, c *harness.Client) string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(c.Dir, ".git", "cloak", "*", "applied"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 1 {
-		t.Fatalf("expected exactly one applied state file, found %d: %v", len(matches), matches)
-	}
-	return matches[0]
+	return soleStateFile(t, c, "applied", "applied state file")
 }
 
 // appliedSetFromBytes parses an applied-set state file's content (one pack id
@@ -359,14 +362,7 @@ func corruptUnappliedPack(t *testing.T, host *harness.Host, applied map[string]b
 // there is not exactly one (the integration clients use a single remote).
 func pinFilePath(t *testing.T, c *harness.Client) string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(c.Dir, ".git", "cloak", "*", "generation"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(matches) != 1 {
-		t.Fatalf("expected exactly one rollback pin file, found %d: %v", len(matches), matches)
-	}
-	return matches[0]
+	return soleStateFile(t, c, "generation", "rollback pin file")
 }
 
 // pinGeneration parses the generation field (the first whitespace-delimited

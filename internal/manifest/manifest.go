@@ -34,12 +34,14 @@ const (
 	maxPacks    = 1 << 14
 )
 
-// isLowerHex reports whether s is exactly n lowercase hex digits ([0-9a-f]),
+// IsLowerHex reports whether s is exactly n lowercase hex digits ([0-9a-f]),
 // the fixed shape of cloak's content-addressed identifiers: pack ids (SHA-256,
 // 64 chars), object ids (SHA-1, 40), and the repo id (16 random bytes, 32). It
 // is the exact non-regex equivalent of `^[0-9a-f]{n}$` (lowercase only, whole
 // string), keeping these untrusted-manifest validators off the regexp engine.
-func isLowerHex(s string, n int) bool {
+// Exported so the engine package's git-object-id parsing (show-index / rev-list
+// output) shares this single validated implementation rather than a copy.
+func IsLowerHex(s string, n int) bool {
 	if len(s) != n {
 		return false
 	}
@@ -173,7 +175,7 @@ func (m *Manifest) validateMeta() error {
 	if m.Version != Version {
 		return fmt.Errorf("manifest: unsupported version %d (this build speaks %d)", m.Version, Version)
 	}
-	if !isLowerHex(m.RepoID, 32) {
+	if !IsLowerHex(m.RepoID, 32) {
 		return fmt.Errorf("manifest: missing or malformed repo id %q", m.RepoID)
 	}
 	if m.Head != "" && !strings.HasPrefix(m.Head, "refs/heads/") {
@@ -197,24 +199,33 @@ func (m *Manifest) validateMeta() error {
 // well-formed object id.
 func (m *Manifest) validateRefs() error {
 	for name, oid := range m.Refs {
-		if !strings.HasPrefix(name, "refs/") {
-			return fmt.Errorf("manifest: ref name %q does not start with refs/", name)
+		if err := validateRef(name, oid); err != nil {
+			return err
 		}
-		// JSON cannot faithfully represent a non-UTF-8 ref name: marshaling
-		// would replace the invalid bytes with U+FFFD and silently corrupt the
-		// stored ref. Reject it so the manifest stays a faithful copy.
-		if !utf8.ValidString(name) {
-			return fmt.Errorf("manifest: ref name %q is not valid UTF-8", name)
-		}
-		// A ref name becomes "<oid> <name>" on its own advertisement line, so a
-		// control character (notably a newline) or space would inject or corrupt
-		// a line in git's protocol stream. Reject it at the root of trust.
-		if hasAdvertUnsafeByte(name) {
-			return fmt.Errorf("manifest: ref name %q contains a control character or space", name)
-		}
-		if !isLowerHex(oid, 40) {
-			return fmt.Errorf("manifest: ref %q has malformed object id %q", name, oid)
-		}
+	}
+	return nil
+}
+
+// validateRef checks that one ref name is under refs/, is valid UTF-8 and
+// advertisement-safe, and that its target is a well-formed object id.
+func validateRef(name, oid string) error {
+	if !strings.HasPrefix(name, "refs/") {
+		return fmt.Errorf("manifest: ref name %q does not start with refs/", name)
+	}
+	// JSON cannot faithfully represent a non-UTF-8 ref name: marshaling
+	// would replace the invalid bytes with U+FFFD and silently corrupt the
+	// stored ref. Reject it so the manifest stays a faithful copy.
+	if !utf8.ValidString(name) {
+		return fmt.Errorf("manifest: ref name %q is not valid UTF-8", name)
+	}
+	// A ref name becomes "<oid> <name>" on its own advertisement line, so a
+	// control character (notably a newline) or space would inject or corrupt
+	// a line in git's protocol stream. Reject it at the root of trust.
+	if hasAdvertUnsafeByte(name) {
+		return fmt.Errorf("manifest: ref name %q contains a control character or space", name)
+	}
+	if !IsLowerHex(oid, 40) {
+		return fmt.Errorf("manifest: ref %q has malformed object id %q", name, oid)
 	}
 	return nil
 }
@@ -239,7 +250,7 @@ func (m *Manifest) validatePacks() (map[string]bool, error) {
 // order so a pack failing several rules reports the same error as the inline
 // loop did.
 func validatePack(p Pack, seen map[string]bool) error {
-	if !isLowerHex(p.ID, 64) {
+	if !IsLowerHex(p.ID, 64) {
 		return fmt.Errorf("manifest: malformed pack id %q", p.ID)
 	}
 	if seen[p.ID] {
@@ -270,7 +281,7 @@ func (m *Manifest) validateReplaces(seen map[string]bool) error {
 // and must not name a still-live pack (present in seen).
 func validatePackReplaces(p Pack, seen map[string]bool) error {
 	for _, r := range p.Replaces {
-		if !isLowerHex(r, 64) {
+		if !IsLowerHex(r, 64) {
 			return fmt.Errorf("manifest: pack %q replaces malformed id %q", p.ID, r)
 		}
 		if seen[r] {

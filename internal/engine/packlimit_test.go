@@ -182,7 +182,7 @@ func FuzzParseObjectPaths(f *testing.F) {
 	f.Fuzz(func(t *testing.T, in string) {
 		got := parseObjectPaths(in)
 		for oid, path := range got {
-			if !isLowerHex(oid, 40) {
+			if !manifest.IsLowerHex(oid, 40) {
 				t.Fatalf("non-oid key %q", oid)
 			}
 			if path == "" {

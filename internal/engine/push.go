@@ -454,18 +454,7 @@ type builtPack struct {
 // through the encryptor into a temp file, sniffing the pack header for the
 // object count so empty packs are dropped.
 func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtPack, error) {
-	var stdin strings.Builder
-	haves := make([]string, 0, len(remoteRefs))
-	for _, w := range wants {
-		fmt.Fprintln(&stdin, w)
-	}
-	stdin.WriteString("--not\n")
-	for _, oid := range remoteRefs {
-		if e.HaveObject(oid) {
-			fmt.Fprintln(&stdin, oid)
-			haves = append(haves, oid)
-		}
-	}
+	stdin, haves := e.buildPackRevs(wants, remoteRefs)
 
 	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), e.Key)
 	if err != nil {
@@ -473,7 +462,7 @@ func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtP
 	}
 	sniff := &packHeadSniffer{dst: pw}
 	if err := e.streamPack(pw, gitx.Opts{GitDir: e.LocalGitDir,
-		Stdin:  strings.NewReader(stdin.String()),
+		Stdin:  strings.NewReader(stdin),
 		Stdout: sniff},
 		"pack objects", "finalize pack",
 		"--revs", "--stdout", "--delta-base-offset"); err != nil {
@@ -490,6 +479,26 @@ func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtP
 		}
 	}
 	return builtPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), count: sniff.count()}, nil
+}
+
+// buildPackRevs assembles the pack-objects --revs stdin (wants, then a "--not"
+// boundary listing the remote refs this repo already has) and returns it
+// alongside the haves used for the pack-size limit check. The haves slice and
+// the stdin "--not" lines are built in the same loop so they stay in agreement.
+func (e *Engine) buildPackRevs(wants []string, remoteRefs map[string]string) (string, []string) {
+	var stdin strings.Builder
+	haves := make([]string, 0, len(remoteRefs))
+	for _, w := range wants {
+		fmt.Fprintln(&stdin, w)
+	}
+	stdin.WriteString("--not\n")
+	for _, oid := range remoteRefs {
+		if e.HaveObject(oid) {
+			fmt.Fprintln(&stdin, oid)
+			haves = append(haves, oid)
+		}
+	}
+	return stdin.String(), haves
 }
 
 // packHeadSniffer reads the object count from the 12-byte pack header

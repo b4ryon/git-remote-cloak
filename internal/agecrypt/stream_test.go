@@ -130,27 +130,10 @@ func TestDecryptReaderContract(t *testing.T) {
 }
 
 func TestRoundTripBoundarySweep(t *testing.T) {
-	k := testKey(t)
 	const chunk = 64 * 1024
 	// Exact multiples and +-1 around the 2nd/3rd chunk boundary (complements
 	// the {0,1,63,64K,64K+1,1M} set in agecrypt_test.go).
-	for _, n := range []int{chunk - 1, 2 * chunk, 2*chunk + 1, 3 * chunk} {
-		pt := make([]byte, n)
-		if _, err := rand.Read(pt); err != nil {
-			t.Fatal(err)
-		}
-		ct, err := EncryptBytes(k, pt)
-		if err != nil {
-			t.Fatalf("size %d: encrypt: %v", n, err)
-		}
-		got, err := DecryptBytes(k, ct)
-		if err != nil {
-			t.Fatalf("size %d: decrypt: %v", n, err)
-		}
-		if !bytes.Equal(got, pt) {
-			t.Fatalf("size %d: round-trip mismatch", n)
-		}
-	}
+	assertRoundTrip(t, testKey(t), []int{chunk - 1, 2 * chunk, 2*chunk + 1, 3 * chunk}, "round-trip mismatch")
 }
 
 // countReader yields n deterministic bytes without allocating them, so a

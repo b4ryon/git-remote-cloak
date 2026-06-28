@@ -245,24 +245,35 @@ func (s *session) list(forPush bool) ([]string, error) {
 	return lines, nil
 }
 
-// handleFetch answers a "fetch " batch: it collects the request lines, applies
-// the missing packs, and writes a "lock" line per kept pack plus the
-// terminating blank line to out.
-func (s *session) handleFetch(in *bufio.Scanner, out *bufio.Writer, line string) error {
-	reqs, err := collectBatch(in, line, "fetch ")
+// runBatch drives the shared shape of the fetch and push command handlers:
+// collect a contiguous same-prefix request batch, process it, then write the
+// resulting report lines followed by the protocol's terminating blank line and
+// flush. fetch and push differ only in their line prefix, batch processor, and
+// per-result formatter, so they delegate here rather than each repeating the
+// collect/process/emit/flush spine.
+func runBatch[T any](in *bufio.Scanner, out *bufio.Writer, line, prefix string,
+	batch func([]string) ([]T, error), format func([]T) []string) error {
+	items, err := collectBatch(in, line, prefix)
 	if err != nil {
 		return err
 	}
-	locks, err := s.fetchBatch(reqs)
+	results, err := batch(items)
 	if err != nil {
 		return err
 	}
-	for _, l := range fetchLockLines(locks) {
+	for _, l := range format(results) {
 		fmt.Fprintln(out, l)
 	}
 	fmt.Fprintln(out)
 	_ = out.Flush()
 	return nil
+}
+
+// handleFetch answers a "fetch " batch: it collects the request lines, applies
+// the missing packs, and writes a "lock" line per kept pack plus the
+// terminating blank line to out.
+func (s *session) handleFetch(in *bufio.Scanner, out *bufio.Writer, line string) error {
+	return runBatch(in, out, line, "fetch ", s.fetchBatch, fetchLockLines)
 }
 
 // fetchLockLines formats the .keep lock paths into the protocol's per-pack
@@ -310,20 +321,7 @@ func (s *session) fetchBatch(reqs []string) ([]string, error) {
 // engine push, and writes an "ok"/"error" line per result plus the terminating
 // blank line to out.
 func (s *session) handlePush(in *bufio.Scanner, out *bufio.Writer, line string) error {
-	specs, err := collectBatch(in, line, "push ")
-	if err != nil {
-		return err
-	}
-	results, err := s.pushBatch(specs)
-	if err != nil {
-		return err
-	}
-	for _, l := range pushReportLines(results) {
-		fmt.Fprintln(out, l)
-	}
-	fmt.Fprintln(out)
-	_ = out.Flush()
-	return nil
+	return runBatch(in, out, line, "push ", s.pushBatch, pushReportLines)
 }
 
 // pushReportLines formats the per-ref push outcomes into the protocol status

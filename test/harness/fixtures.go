@@ -274,14 +274,24 @@ func (c *Client) GitEnv(extra []string, args ...string) (string, string, error) 
 	return c.runEnv(append(append([]string{}, c.Env...), extra...), "git", args...)
 }
 
+// mustRun runs the given command runner (Git or Cloak) and fails the test with a
+// labeled command trace on error, otherwise returns the trimmed stdout. It owns
+// the shared check/trace/trim tail of MustGit/MustCloak so the failure-trace
+// format lives in one place. Callers keep their own c.T.Helper() so the reported
+// failure line stays the test's call site, not this delegation.
+func (c *Client) mustRun(label string, run func(...string) (string, string, error), args ...string) string {
+	c.T.Helper()
+	out, errb, err := run(args...)
+	if err != nil {
+		c.T.Fatalf("%s %v: %v\nstdout: %s\nstderr: %s", label, args, err, out, errb)
+	}
+	return strings.TrimSpace(out)
+}
+
 // MustGit runs git and fails the test on error.
 func (c *Client) MustGit(args ...string) string {
 	c.T.Helper()
-	out, errb, err := c.Git(args...)
-	if err != nil {
-		c.T.Fatalf("git %v: %v\nstdout: %s\nstderr: %s", args, err, out, errb)
-	}
-	return strings.TrimSpace(out)
+	return c.mustRun("git", c.Git, args...)
 }
 
 // Cloak runs the git-cloak operator binary in the client environment.
@@ -313,11 +323,7 @@ func (c *Client) CloakStdinBytes(s string, args ...string) ([]byte, string, erro
 // MustCloak runs git-cloak and fails the test on error.
 func (c *Client) MustCloak(args ...string) string {
 	c.T.Helper()
-	out, errb, err := c.Cloak(args...)
-	if err != nil {
-		c.T.Fatalf("git-cloak %v: %v\nstdout: %s\nstderr: %s", args, err, out, errb)
-	}
-	return strings.TrimSpace(out)
+	return c.mustRun("git-cloak", c.Cloak, args...)
 }
 
 // InstallGitShim places a `git` wrapper first on the client's PATH that

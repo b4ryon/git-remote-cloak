@@ -110,7 +110,7 @@ func parseObjectPaths(revListOut string) map[string]string {
 	paths := map[string]string{}
 	for _, line := range strings.Split(revListOut, "\n") {
 		oid, path, found := strings.Cut(line, " ")
-		if found && path != "" && isLowerHex(oid, 40) {
+		if found && path != "" && manifest.IsLowerHex(oid, 40) {
 			paths[oid] = path
 		}
 	}
