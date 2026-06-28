@@ -52,23 +52,44 @@ func (e *Engine) consolidate(cur *RemoteState, plan *pushPlan, victims []manifes
 // indexVictims indexes each victim pack into the scratch repository and reports
 // whether every victim was already applied locally (canMark): the merged pack
 // can be marked applied only when all the packs folded into it were. The
-// not-yet-pushed pack (plan.packID) is sourced from disk; the rest download.
+// not-yet-pushed pack(s) (plan.packs) are sourced from disk; the rest download.
 func (e *Engine) indexVictims(scratchGit string, cur *RemoteState, plan *pushPlan, victims []manifest.Pack) ([]string, bool, error) {
 	applied, err := e.St.AppliedSet()
 	if err != nil {
 		return nil, false, err
 	}
-	victimIDs, canMark := canMarkConsolidated(victims, plan.packID, applied)
+	// Map each not-yet-pushed pack to its local ciphertext so a victim among them
+	// is indexed from disk rather than downloaded. The over-limit guard keeps any
+	// bin-split pack out of the victim set (they always exceed when merged), so in
+	// practice at most one plan pack -- the single incremental pack -- is a victim.
+	localPaths := make(map[string]string, len(plan.packs))
+	for _, p := range plan.packs {
+		localPaths[p.id] = p.path
+	}
+	victimIDs, canMark := canMarkConsolidated(victims, firstVictimPlanPack(plan.packs, victims), applied)
 	for _, v := range victims {
-		localPath := ""
-		if v.ID == plan.packID {
-			localPath = plan.packPath
-		}
-		if err := e.indexPackInto(scratchGit, cur.Head, v, localPath); err != nil {
+		if err := e.indexPackInto(scratchGit, cur.Head, v, localPaths[v.ID]); err != nil {
 			return nil, false, err
 		}
 	}
 	return victimIDs, canMark, nil
+}
+
+// firstVictimPlanPack returns the id of the first plan pack that appears in the
+// victim set (the not-yet-pushed pack to source from disk), or "" if none do.
+// canMarkConsolidated takes a single such id; the over-limit guard guarantees at
+// most one plan pack is ever a victim, so a single id suffices.
+func firstVictimPlanPack(packs []plannedPack, victims []manifest.Pack) string {
+	inVictims := make(map[string]bool, len(victims))
+	for _, v := range victims {
+		inVictims[v.ID] = true
+	}
+	for _, p := range packs {
+		if inVictims[p.id] {
+			return p.id
+		}
+	}
+	return ""
 }
 
 // canMarkConsolidated returns the victim ids in order and reports whether the
@@ -120,12 +141,25 @@ func (e *Engine) packConsolidated(scratchGit string) (*agecrypt.PackWriter, erro
 // the new pack carrying their ids as Replaces, removes the superseded local
 // ciphertext, and re-validates the resulting manifest.
 func (e *Engine) applyConsolidation(plan *pushPlan, pw *agecrypt.PackWriter, victimIDs []string, canMark bool) error {
-	if plan.packPath != "" {
-		_ = os.Remove(plan.packPath)
+	// Drop the plan packs folded into the merged pack (remove their local
+	// ciphertext); keep any plan pack that was not a victim so it is still
+	// published alongside the merged one.
+	victimSet := make(map[string]bool, len(victimIDs))
+	for _, id := range victimIDs {
+		victimSet[id] = true
+	}
+	var survivors []plannedPack
+	for _, p := range plan.packs {
+		if victimSet[p.id] {
+			if p.path != "" {
+				_ = os.Remove(p.path)
+			}
+			continue
+		}
+		survivors = append(survivors, p)
 	}
 	plan.man.Packs = consolidatedPacks(plan.man.Packs, victimIDs, pw.ID(), pw.Size())
-	plan.packID, plan.packPath, plan.packSize = pw.ID(), pw.Path(), pw.Size()
-	plan.markApplied = canMark
+	plan.packs = append(survivors, plannedPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), applied: canMark})
 	if err := plan.man.Validate(); err != nil {
 		return fmt.Errorf("consolidated manifest invalid (bug): %w", err)
 	}
@@ -253,7 +287,8 @@ func (e *Engine) repackOnce(cur *RemoteState, key keystore.Key, rekeyed bool, at
 // returns the resolved attempt carrying the new remote state. The merged pack is
 // always marked applied (its objects came from the local repository).
 func (e *Engine) acceptRepack(man *manifest.Manifest, bc builtCommit, rekeyed bool) (repackAttempt, error) {
-	if err := e.persistPushed(man.Generation, bc.manifestHash, man.RepoID, man.Packs[0].ID, true); err != nil {
+	if err := e.persistPushed(man.Generation, bc.manifestHash, man.RepoID,
+		[]plannedPack{{id: man.Packs[0].ID, applied: true}}); err != nil {
 		return repackAttempt{}, err
 	}
 	e.Log.Info("full repack pushed", "generation", man.Generation,
@@ -336,7 +371,7 @@ func repackManifest(cur *RemoteState, id string, size int64) *manifest.Manifest 
 // outcome. The returned PushResult is meaningful only when err is nil.
 func (e *Engine) commitAndPushRepack(cur *RemoteState, man *manifest.Manifest, pw *agecrypt.PackWriter, key keystore.Key) (backend.PushResult, builtCommit, error) {
 	bc, err := e.buildBackendCommit(commitInput{
-		man: man, packID: pw.ID(), packPath: pw.Path(),
+		man: man, packs: []plannedPack{{id: pw.ID(), path: pw.Path(), size: pw.Size(), applied: true}},
 		blobSource: "", parent: "", key: key,
 	})
 	_ = os.Remove(pw.Path())

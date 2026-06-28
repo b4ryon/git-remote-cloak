@@ -33,14 +33,21 @@ func TestPackHeadSnifferCount(t *testing.T) {
 }
 
 func TestPushPlanAbort(t *testing.T) {
-	f := filepath.Join(t.TempDir(), "pack.age")
-	if err := os.WriteFile(f, []byte("ct"), 0o600); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "pack1.age")
+	f2 := filepath.Join(dir, "pack2.age")
+	for _, f := range []string{f1, f2} {
+		if err := os.WriteFile(f, []byte("ct"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	plan := &pushPlan{packPath: f}
+	// A bin-packed push carries several temp packs; abort must remove all of them.
+	plan := &pushPlan{packs: []plannedPack{{path: f1}, {path: f2}}}
 	plan.abort()
-	if _, err := os.Stat(f); !os.IsNotExist(err) {
-		t.Fatalf("abort left temp pack in place: %v", err)
+	for _, f := range []string{f1, f2} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("abort left temp pack in place: %v", err)
+		}
 	}
 
 	var nilPlan *pushPlan

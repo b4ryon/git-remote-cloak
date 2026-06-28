@@ -658,6 +658,16 @@ func FuzzRepackManifest(f *testing.F) {
 	})
 }
 
+// planPacksFrom builds the plannedPack slice for the fuzzers from a single
+// (id, size): empty when id is "", mirroring the pre-slice "append iff id != \"\""
+// contract that nextPushManifest still upholds per pack.
+func planPacksFrom(id string, size int64) []plannedPack {
+	if id == "" {
+		return nil
+	}
+	return []plannedPack{{id: id, size: size}}
+}
+
 // FuzzNextPushManifest pins nextPushManifest, the normal-push manifest builder
 // and the write-side counterpart to FuzzRepackManifest (which covers the rarer
 // FullRepack builder). assembleManifest resolves the random repo id and the git
@@ -719,7 +729,7 @@ func FuzzNextPushManifest(f *testing.F) {
 		}
 		wantNewRefs := maps.Clone(newRefs)
 
-		man := nextPushManifest(base, newRefs, head, newID, newSize)
+		man := nextPushManifest(base, newRefs, head, planPacksFrom(newID, newSize))
 
 		// Generation bump, wholesale install of the published ref set/head, and
 		// carry-over of version/repo identity.
@@ -743,7 +753,7 @@ func FuzzNextPushManifest(f *testing.F) {
 		// (a fresh newRefs clone, since the scribble above mutated the aliased one).
 		// The scribble left man.Packs's length intact, so it stands in for the
 		// expected pack count.
-		man2 := nextPushManifest(base, maps.Clone(wantNewRefs), head, newID, newSize)
+		man2 := nextPushManifest(base, maps.Clone(wantNewRefs), head, planPacksFrom(newID, newSize))
 		if man2.Generation != gen+1 || man2.Head != head || man2.RepoID != repoID ||
 			!maps.Equal(man2.Refs, wantNewRefs) || len(man2.Packs) != len(man.Packs) {
 			t.Fatalf("nextPushManifest not deterministic")

@@ -76,6 +76,32 @@ func TestConsolidationWouldExceed(t *testing.T) {
 	}
 }
 
+func TestSplitBudget(t *testing.T) {
+	const mib int64 = 1 << 20
+	cases := []struct {
+		name  string
+		limit int64
+		want  int64
+	}{
+		{"disabled", 0, 0},
+		{"negative", -1, 0},
+		{"1 MiB is below git's split floor", mib, 0},
+		{"100 MiB", 100 * mib, 100*mib - (100*mib/2048 + 4096)},
+		{"4 MiB", 4 * mib, 4*mib - (4*mib/2048 + 4096)},
+	}
+	for _, c := range cases {
+		got := splitBudget(c.limit)
+		if got != c.want {
+			t.Errorf("%s: splitBudget(%d) = %d, want %d", c.name, c.limit, got, c.want)
+		}
+		// A non-zero budget is always strictly under the limit (so the encrypted
+		// pack fits) and at least git's 1 MiB --max-pack-size floor.
+		if got != 0 && (got >= c.limit || got < mib) {
+			t.Errorf("%s: budget %d not in [1 MiB, limit=%d)", c.name, got, c.limit)
+		}
+	}
+}
+
 // realRepoWithBlobs builds a temp repo with a large and a small file and returns
 // its git dir and HEAD oid.
 func realRepoWithBlobs(t *testing.T) (gitDir, head string) {
@@ -168,8 +194,8 @@ func TestMaybeConsolidateSkipsOverLimit(t *testing.T) {
 	if squash {
 		t.Fatal("over-limit consolidation should be skipped (squash=false)")
 	}
-	if len(plan.man.Packs) != 4 || plan.packID != "" {
-		t.Fatalf("plan was mutated by a skipped consolidation: packs=%d packID=%q", len(plan.man.Packs), plan.packID)
+	if len(plan.man.Packs) != 4 || len(plan.packs) != 0 {
+		t.Fatalf("plan was mutated by a skipped consolidation: packs=%d planPacks=%d", len(plan.man.Packs), len(plan.packs))
 	}
 }
 

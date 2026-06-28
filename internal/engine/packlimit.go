@@ -65,6 +65,89 @@ func sumPackSizes(packs []manifest.Pack) int64 {
 	return total
 }
 
+// splitBudget returns the plaintext --max-pack-size to hand `git pack-objects`
+// when splitting an over-limit push into multiple packs, or 0 when the limit is
+// too small (or disabled) to split usefully. age does not compress, so a pack's
+// ciphertext is its plaintext size plus a tiny near-constant overhead (an ~200 B
+// header and a 16 B tag per 64 KiB chunk, ~0.025%); we subtract a margin of
+// limit/2048 + 4 KiB (well above that overhead, also absorbing git's approximate
+// enforcement) so each encrypted pack stays under limit. git itself floors
+// --max-pack-size at 1 MiB, so a budget below that returns 0: the caller then
+// keeps a single pack and the post-build size check reports it if it still does
+// not fit (a sub-MiB host limit is pathological and cannot be split anyway).
+func splitBudget(limit int64) int64 {
+	if limit <= 0 {
+		return 0
+	}
+	budget := limit - (limit/2048 + 4096)
+	if budget < 1<<20 {
+		return 0
+	}
+	return budget
+}
+
+// pushFileTooLargeErr builds the push-path TooLarge error for a single file
+// whose encrypted pack (encSize) exceeds the host's per-file limit -- the one
+// case bin-packing cannot fix, because git cannot split a single object across
+// packs. file names the offending path ("" when git enumeration failed). The
+// wording is written end-to-end here (via cloakerr.Newmsg) so it stays short and
+// actionable; it keeps the TooLarge Kind for classification.
+func pushFileTooLargeErr(encSize, limit int64, file string) error {
+	if file == "" {
+		file = "(one file)"
+	}
+	msg := fmt.Sprintf("cloak: push blocked - one file exceeds the host's per-file limit.\n"+
+		"  %s   %s encrypted  (limit %s)\n"+
+		"  The host keeps each pack as one file (GitHub caps files at 100 MiB).\n"+
+		"  Fix: remove it, move it to git-lfs, or raise\n"+
+		"       cloak.maxPackBytes  (git config cloak.maxPackBytes <bytes>; 0 = off)",
+		file, humanBytes(encSize), humanBytes(limit))
+	return cloakerr.Newmsg(cloakerr.TooLarge, msg)
+}
+
+// offendingFile names the worktree path of the largest blob stored in the
+// over-limit split pack at plainPackPath (read from the pack itself via
+// verify-pack, then mapped to a path through the pushed objects). Best-effort:
+// any git failure yields "", and the caller falls back to a generic noun.
+func (e *Engine) offendingFile(plainPackPath string, wants []string) string {
+	out, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir}, "verify-pack", "-v", plainPackPath)
+	if err != nil {
+		return ""
+	}
+	// verify-pack -v lines: "<oid> <type> <size> <size-in-pack> <offset> [depth base]".
+	var bestOID string
+	var bestPacked int64 = -1
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 || f[1] != "blob" || !manifest.IsLowerHex(f[0], 40) {
+			continue
+		}
+		packed, perr := strconv.ParseInt(f[3], 10, 64)
+		if perr != nil {
+			continue
+		}
+		if packed > bestPacked {
+			bestPacked, bestOID = packed, f[0]
+		}
+	}
+	if bestOID == "" {
+		return ""
+	}
+	return e.objectPaths(wants)[bestOID]
+}
+
+// objectPaths maps object id -> worktree path for the objects reachable from
+// wants in the local repository (commits, which have no path, are dropped by
+// parseObjectPaths). Best-effort: a git failure yields nil.
+func (e *Engine) objectPaths(wants []string) map[string]string {
+	args := append([]string{"rev-list", "--objects"}, wants...)
+	out, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir}, args...)
+	if err != nil {
+		return nil
+	}
+	return parseObjectPaths(out)
+}
+
 // largestObjects returns the largest blobs (by uncompressed size, descending,
 // capped at maxReportedFiles) among the objects a pack would carry: those
 // reachable from wants but not from haves in the local repository. Best-effort:

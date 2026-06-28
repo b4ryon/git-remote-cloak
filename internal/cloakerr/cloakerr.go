@@ -87,9 +87,16 @@ type Error struct {
 	Op   string
 	Err  error
 	Hint string
+	// custom, when non-empty, is returned verbatim by Error() instead of the
+	// per-Kind prefix/op/hint composition. It lets a site hand-craft the entire
+	// user-facing wording while still carrying a Kind for classification.
+	custom string
 }
 
 func (e *Error) Error() string {
+	if e.custom != "" {
+		return e.custom
+	}
 	prefix := "cloak: error"
 	if k := e.Kind; k >= 0 && int(k) < len(kindInfo) {
 		prefix = kindInfo[k].prefix
@@ -123,6 +130,15 @@ func Newf(kind Kind, op, format string, args ...any) *Error {
 // actionable hint, for sites that know both the message and the next step.
 func Newfh(kind Kind, op, hint, format string, args ...any) *Error {
 	return &Error{Kind: kind, Op: op, Err: fmt.Errorf(format, args...), Hint: hint}
+}
+
+// Newmsg builds a classified Error whose user-facing text is exactly msg (which
+// should already begin with "cloak:"). Unlike Newf/Newfh it bypasses the
+// per-Kind prefix and the op/hint composition, for the rare error whose
+// multi-line wording is written end-to-end at the call site but still needs a
+// Kind for classification and retry decisions.
+func Newmsg(kind Kind, msg string) *Error {
+	return &Error{Kind: kind, custom: msg}
 }
 
 // WithHint attaches an actionable next-step hint and returns e for chaining.

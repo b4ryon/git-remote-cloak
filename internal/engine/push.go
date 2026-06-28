@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -123,11 +125,11 @@ func (e *Engine) pushOnce(cur *RemoteState, updates []RefUpdate, dryRun bool, at
 // it persists the pin/repo-id/applied state, logs acceptance, and returns the
 // resolved attempt carrying the new remote state.
 func (e *Engine) acceptPush(results []RefResult, plan *pushPlan, bc builtCommit, updates []RefUpdate, attempt int) (pushAttempt, error) {
-	if err := e.persistPushed(plan.man.Generation, bc.manifestHash, plan.man.RepoID, plan.packID, plan.markApplied); err != nil {
+	if err := e.persistPushed(plan.man.Generation, bc.manifestHash, plan.man.RepoID, plan.packs); err != nil {
 		return pushAttempt{}, err
 	}
 	e.Log.Info("push accepted", "generation", plan.man.Generation,
-		"attempt", attempt, "new_pack", plan.packID != "", "refs", len(updates))
+		"attempt", attempt, "new_packs", len(plan.packs), "refs", len(updates))
 	return pushAttempt{results: results, state: &RemoteState{Head: bc.commit, Manifest: plan.man, ManifestHash: bc.manifestHash}, done: true}, nil
 }
 
@@ -189,7 +191,7 @@ func (e *Engine) commitAndExecute(cur *RemoteState, plan *pushPlan, squash bool,
 		}
 	}
 	bc, err := e.buildBackendCommit(commitInput{
-		man: plan.man, packID: plan.packID, packPath: plan.packPath,
+		man: plan.man, packs: plan.packs,
 		blobSource: blobSource, parent: parent, key: e.Key,
 	})
 	if err != nil {
@@ -207,37 +209,58 @@ func (e *Engine) commitAndExecute(cur *RemoteState, plan *pushPlan, squash bool,
 }
 
 // persistPushed records a freshly accepted push locally: the manifest pin, the
-// repo id, and (when markApplied and a pack was added) the new pack as already
-// applied. Called only after the backend reports backend.PushOK.
-func (e *Engine) persistPushed(gen uint64, hash, repoID, packID string, markApplied bool) error {
+// repo id, and each pack whose objects are already present locally (p.applied)
+// as applied. Called only after the backend reports backend.PushOK.
+func (e *Engine) persistPushed(gen uint64, hash, repoID string, packs []plannedPack) error {
 	// Persist both pins together (see state.SavePins): a partial save must not
 	// leave a generation pin without its repo-id pin.
 	if err := e.St.SavePins(state.Pin{Generation: gen, ManifestHash: hash}, repoID); err != nil {
 		return err
 	}
-	if markApplied && packID != "" {
-		if err := e.St.MarkApplied(packID); err != nil {
-			return err
+	// Mark only the packs whose objects are known present locally (a freshly
+	// built push pack always is; a consolidation pack only when every folded
+	// victim was). MarkApplied is one atomic rewrite over all ids and no-ops on
+	// an empty list, so the manifest-only push needs no special case.
+	var appliedIDs []string
+	for _, p := range packs {
+		if p.applied {
+			appliedIDs = append(appliedIDs, p.id)
 		}
+	}
+	if len(appliedIDs) > 0 {
+		return e.St.MarkApplied(appliedIDs...)
 	}
 	return nil
 }
 
-// pushPlan carries one prepared attempt: the new manifest, the encrypted
-// pack temp file (if any), and cleanup. markApplied records whether the
-// pack's objects are known to exist locally (own pushes yes; a
-// consolidation that merged never-applied packs no).
+// plannedPack is one encrypted pack a push will publish: its content-addressed
+// id, the ciphertext temp file to upload, its ciphertext size, and whether its
+// objects are known present locally (so it may be marked applied on accept; own
+// pushes yes, a consolidation that merged never-applied packs no).
+type plannedPack struct {
+	id      string
+	path    string
+	size    int64
+	applied bool
+}
+
+// pushPlan carries one prepared attempt: the new manifest and the encrypted
+// pack temp files it will publish -- none for a manifest-only push, one for the
+// common case, several when an over-limit push was bin-packed. abort() removes
+// the temp files.
 type pushPlan struct {
-	man         *manifest.Manifest
-	packID      string
-	packPath    string
-	packSize    int64
-	markApplied bool
+	man   *manifest.Manifest
+	packs []plannedPack
 }
 
 func (p *pushPlan) abort() {
-	if p != nil && p.packPath != "" {
-		_ = os.Remove(p.packPath)
+	if p == nil {
+		return
+	}
+	for _, pk := range p.packs {
+		if pk.path != "" {
+			_ = os.Remove(pk.path)
+		}
 	}
 }
 
@@ -296,22 +319,17 @@ func (e *Engine) planRefUpdates(remoteRefs map[string]string, updates []RefUpdat
 	return results, newRefs, wants, accepted
 }
 
-// buildPlanPack creates a fresh pushPlan and, when there are wants, encrypts a
-// pack of the missing objects into it. An empty pack (count==0) is discarded so
-// the plan stays packless; only a non-empty pack sets markApplied.
+// buildPlanPack creates a fresh pushPlan and, when there are wants, encrypts the
+// missing objects into one or more sub-limit packs (see buildPacks). With no new
+// objects the plan stays packless (a manifest-only push).
 func (e *Engine) buildPlanPack(wants []string, remoteRefs map[string]string) (*pushPlan, error) {
 	plan := &pushPlan{}
 	if len(wants) > 0 {
-		bp, err := e.buildPack(wants, remoteRefs)
+		packs, err := e.buildPacks(wants, remoteRefs)
 		if err != nil {
 			return nil, err
 		}
-		if bp.count > 0 {
-			plan.packID, plan.packPath, plan.packSize = bp.id, bp.path, bp.size
-			plan.markApplied = true
-		} else if bp.path != "" {
-			_ = os.Remove(bp.path)
-		}
+		plan.packs = packs
 	}
 	return plan, nil
 }
@@ -334,7 +352,7 @@ func (e *Engine) assembleManifest(curMan *manifest.Manifest, newRefs map[string]
 		// push metadata; the helper cannot verify host privacy over plain git.
 		e.Log.Warn("creating a new cloak backend on this remote; ensure the host repository is PRIVATE (cloak hides contents, not the repo's existence/name/owner or push timing and sizes)")
 	}
-	man := nextPushManifest(base, newRefs, e.headForManifest(curMan, newRefs), plan.packID, plan.packSize)
+	man := nextPushManifest(base, newRefs, e.headForManifest(curMan, newRefs), plan.packs)
 	if err := man.Validate(); err != nil {
 		plan.abort()
 		return fmt.Errorf("constructed manifest invalid (bug): %w", err)
@@ -347,18 +365,18 @@ func (e *Engine) assembleManifest(curMan *manifest.Manifest, newRefs map[string]
 // current remote manifest, or a freshly minted one carrying only the new RepoID
 // on the first push). It clones base so the cached remote state is never
 // mutated, bumps the rollback generation by exactly one, installs the new ref
-// set and head, and appends the new pack when packID != "" while RETAINING
+// set and head, and appends each newly built pack while RETAINING
 // every pack base already carried (in order): a normal push adds a pack, it
 // never drops a live one, so clients keep access to the objects those packs
 // hold. This is the normal-push counterpart to repackManifest, which instead
 // replaces the whole pack set with a single merged pack.
-func nextPushManifest(base *manifest.Manifest, newRefs map[string]string, head, packID string, packSize int64) *manifest.Manifest {
+func nextPushManifest(base *manifest.Manifest, newRefs map[string]string, head string, packs []plannedPack) *manifest.Manifest {
 	man := base.Clone()
 	man.Generation++
 	man.Refs = newRefs
 	man.Head = head
-	if packID != "" {
-		man.Packs = append(man.Packs, manifest.Pack{ID: packID, Size: packSize})
+	for _, p := range packs {
+		man.Packs = append(man.Packs, manifest.Pack{ID: p.id, Size: p.size})
 	}
 	return man
 }
@@ -450,12 +468,47 @@ type builtPack struct {
 	count uint32
 }
 
-// buildPack streams `git pack-objects` (wants minus the remote's haves)
-// through the encryptor into a temp file, sniffing the pack header for the
-// object count so empty packs are dropped.
-func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtPack, error) {
+// buildPacks builds the encrypted pack(s) for wants (minus the remote's haves).
+// The common case is a single pack from the pure-streaming path; if that pack
+// would exceed the host's per-file limit, the objects are re-packed into several
+// sub-limit packs via git's --max-pack-size and each is encrypted. It returns
+// the planned packs (all marked applied -- their objects were just read from the
+// local repo), or nil when there are no new objects. A residual pack that still
+// exceeds the limit holds a single over-limit object and yields a TooLarge error
+// naming that file.
+func (e *Engine) buildPacks(wants []string, remoteRefs map[string]string) ([]plannedPack, error) {
 	stdin, haves := e.buildPackRevs(wants, remoteRefs)
+	bp, err := e.buildSinglePack(stdin)
+	if err != nil {
+		return nil, err
+	}
+	if bp.count == 0 {
+		if bp.path != "" {
+			_ = os.Remove(bp.path)
+		}
+		return nil, nil
+	}
+	budget := splitBudget(e.Cfg.MaxPackBytes)
+	if e.Cfg.MaxPackBytes <= 0 || bp.size <= e.Cfg.MaxPackBytes || budget == 0 {
+		// The single pack fits, the limit is disabled, or the limit is too small
+		// to split: keep the streamed pack but still enforce the limit (a tiny
+		// limit that cannot be split must still refuse an over-limit single pack).
+		if err := e.checkPackLimit("push", bp.size, wants, haves); err != nil {
+			_ = os.Remove(bp.path)
+			return nil, err
+		}
+		return []plannedPack{{id: bp.id, path: bp.path, size: bp.size, applied: true}}, nil
+	}
+	// Over the limit and splittable: discard the single pack and bin-pack.
+	_ = os.Remove(bp.path)
+	return e.splitEncryptPacks(stdin, wants, budget)
+}
 
+// buildSinglePack streams `git pack-objects --revs --stdout` for the given revs
+// stdin through the encryptor into a temp file, sniffing the pack header for the
+// object count so empty packs are dropped. It does NOT enforce the size limit;
+// the caller decides whether the pack fits or must be split.
+func (e *Engine) buildSinglePack(stdin string) (builtPack, error) {
 	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), e.Key)
 	if err != nil {
 		return builtPack{}, err
@@ -469,16 +522,85 @@ func (e *Engine) buildPack(wants []string, remoteRefs map[string]string) (builtP
 		return builtPack{}, err
 	}
 	e.Log.Info("built pack", "objects", sniff.count(), "ciphertext_bytes", pw.Size())
-	// Refuse before any upload if the new pack would not fit the host's per-file
-	// limit. Only a non-empty pack is checked (an empty pack is discarded by the
-	// caller). streamPack left the ciphertext temp file, so remove it on refusal.
-	if sniff.count() > 0 {
-		if err := e.checkPackLimit("push", pw.Size(), wants, haves); err != nil {
-			_ = os.Remove(pw.Path())
-			return builtPack{}, err
+	return builtPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), count: sniff.count()}, nil
+}
+
+// splitEncryptPacks re-packs the same revs stdin into multiple sub-limit packs
+// with git's --max-pack-size (which, unlike --stdout, must write to files), then
+// encrypts each plaintext pack into its own ciphertext temp file. git produces
+// complete, self-contained packs when splitting (no cross-pack thin deltas), so
+// fetch can index-pack each independently. A produced pack that still exceeds
+// the limit holds a single object larger than the limit -- which no split can
+// fix -- and yields a TooLarge error naming the offending file. The scratch
+// plaintext packs live under TmpDir() (the local repo is plaintext anyway) and
+// are removed on return; ciphertext temp files are cleaned up on any error.
+func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64) ([]plannedPack, error) {
+	scratch, err := os.MkdirTemp(e.St.TmpDir(), "split-")
+	if err != nil {
+		return nil, fmt.Errorf("create pack-split scratch dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+
+	base := filepath.Join(scratch, "pack")
+	if _, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir, Stdin: strings.NewReader(stdin)},
+		"pack-objects", "--revs", "--delta-base-offset",
+		"--max-pack-size", strconv.FormatInt(budget, 10), base); err != nil {
+		return nil, cloakerr.New(cloakerr.LocalGit, "split pack objects", err)
+	}
+	plainPacks, err := filepath.Glob(base + "-*.pack")
+	if err != nil {
+		return nil, fmt.Errorf("list split packs: %w", err)
+	}
+	sort.Strings(plainPacks)
+
+	var packs []plannedPack
+	cleanup := func() {
+		for _, p := range packs {
+			_ = os.Remove(p.path)
 		}
 	}
-	return builtPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), count: sniff.count()}, nil
+	for _, pf := range plainPacks {
+		pp, err := e.encryptPackFile(pf)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		if e.Cfg.MaxPackBytes > 0 && pp.size > e.Cfg.MaxPackBytes {
+			_ = os.Remove(pp.path)
+			cleanup()
+			return nil, pushFileTooLargeErr(pp.size, e.Cfg.MaxPackBytes, e.offendingFile(pf, wants))
+		}
+		packs = append(packs, pp)
+	}
+	if len(packs) == 0 {
+		return nil, nil
+	}
+	e.Log.Info("split oversized push into packs", "packs", len(packs))
+	return packs, nil
+}
+
+// encryptPackFile encrypts the plaintext pack at plainPath (one of the split
+// outputs) into a fresh ciphertext temp file, returning its planned-pack
+// identity. The objects were read from the local repo, so applied is true.
+func (e *Engine) encryptPackFile(plainPath string) (plannedPack, error) {
+	in, err := os.Open(plainPath) // #nosec G304 -- plainPath is a TmpDir scratch pack git just wrote; no untrusted component
+	if err != nil {
+		return plannedPack{}, fmt.Errorf("open split pack %q: %w", plainPath, err)
+	}
+	defer func() { _ = in.Close() }()
+	pw, err := agecrypt.NewPackWriter(e.St.TmpDir(), e.Key)
+	if err != nil {
+		return plannedPack{}, err
+	}
+	if _, err := io.Copy(pw, in); err != nil {
+		pw.Abort()
+		return plannedPack{}, cloakerr.New(cloakerr.Crypto, "encrypt split pack", err)
+	}
+	if err := pw.Close(); err != nil {
+		pw.Abort()
+		return plannedPack{}, cloakerr.New(cloakerr.Crypto, "finalize split pack", err)
+	}
+	return plannedPack{id: pw.ID(), path: pw.Path(), size: pw.Size(), applied: true}, nil
 }
 
 // buildPackRevs assembles the pack-objects --revs stdin (wants, then a "--not"
@@ -560,10 +682,9 @@ func selectManifestHead(local string, localOK bool, prev *manifest.Manifest, ref
 // commitInput describes one backend commit to assemble.
 type commitInput struct {
 	man        *manifest.Manifest
-	packID     string // new pack id ("" = manifest-only commit)
-	packPath   string // ciphertext temp file holding the new pack
-	blobSource string // commit whose packs/ blobs get reused ("" = none)
-	parent     string // commit parent ("" = squash root commit)
+	packs      []plannedPack // newly built packs to publish (none = manifest-only commit)
+	blobSource string        // commit whose packs/ blobs get reused ("" = none)
+	parent     string        // commit parent ("" = squash root commit)
 	key        keystore.Key
 }
 
@@ -626,12 +747,12 @@ func (e *Engine) treePackBlobs(in commitInput) (map[string]string, error) {
 	}
 	// Keep only blobs for packs still live in the manifest.
 	retainLivePackBlobs(packOIDs, in.man.PackIDs())
-	if in.packID != "" {
-		oid, err := e.hashPackBlob(in.packPath)
+	for _, p := range in.packs {
+		oid, err := e.hashPackBlob(p.path)
 		if err != nil {
 			return nil, err
 		}
-		packOIDs[in.packID] = oid
+		packOIDs[p.id] = oid
 	}
 	// Every pack the manifest declares live must have a blob in the tree we are
 	// about to publish. PackBlobOIDs reuses only blobs the host's current tree

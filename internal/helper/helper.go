@@ -159,7 +159,12 @@ func (s *session) fatal(err error) int {
 	}
 	fmt.Fprintln(s.stderr, "see the debug log for details: "+logPath)
 	if s.log != nil {
-		s.log.Error("fatal", "err", err.Error())
+		// Record the full error in the per-repo debug-log FILE only, not on
+		// stderr: the user-facing message was already printed above via
+		// cloakerr.Message, and re-emitting err.Error() through the structured
+		// logger duplicated it on stderr. The stderr handler is fixed at warn
+		// (see logx/setup), so Info reaches the info-level file but never stderr.
+		s.log.Info("fatal", "err", err.Error())
 	}
 	return 1
 }
