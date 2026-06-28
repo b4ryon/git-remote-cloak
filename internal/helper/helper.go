@@ -42,12 +42,10 @@ type session struct {
 	dryRun    bool
 	forceAll  bool
 
-	// progress mirrors git's "option progress" (whether to show a live spinner
-	// on stderr); progressSet records whether git sent it, so an unset option
-	// falls back to a TTY check rather than defaulting to silent.
-	progress    bool
-	progressSet bool
-	spin        *progress.Spinner
+	// spin is the stderr progress indicator. It also proxies all helper stderr
+	// (s.stderr is set to it in Main), so logs/errors never glue onto a live
+	// indicator line. Animation honors git's "option progress" via SetWant.
+	spin *progress.Spinner
 
 	ready bool
 }
@@ -59,8 +57,11 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "cloak: usage: git-remote-cloak <remote> <url>")
 		return 2
 	}
-	s := &session{stderr: stderr, remoteName: args[0], url: args[len(args)-1]}
-	s.log, _ = logx.Setup(logx.Options{Stderr: stderr, StderrLevel: slog.LevelWarn, Role: "helper"})
+	// Route all helper stderr (logs, errors, and the progress animation) through
+	// one Spinner so nothing glues onto a live indicator line.
+	spin := progress.New(stderr)
+	s := &session{stderr: spin, spin: spin, remoteName: args[0], url: args[len(args)-1]}
+	s.log, _ = logx.Setup(logx.Options{Stderr: spin, StderrLevel: slog.LevelWarn, Role: "helper"})
 	defer s.cleanup()
 
 	in := bufio.NewScanner(stdin)
@@ -73,6 +74,10 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		if err != nil {
 			return s.fatal(err)
 		}
+		// Clear any live indicator before blocking on the next command: git may
+		// print its own summary to the terminal while we wait, and it writes
+		// directly (not through our Spinner), so the line must already be clean.
+		s.spin.Stop()
 		if done {
 			return 0
 		}
@@ -187,8 +192,7 @@ func (s *session) option(rest string) string {
 		_, _ = fmt.Sscanf(value, "%d", &s.verbosity)
 		return "ok"
 	case "progress":
-		s.progress = value == "true"
-		s.progressSet = true
+		s.spin.SetWant(value == "true")
 		return "ok"
 	case "dry-run":
 		s.dryRun = value == "true"
@@ -207,10 +211,10 @@ func (s *session) ensure() error {
 	if s.ready {
 		return nil
 	}
-	// Start the spinner before the (potentially slow) initial host fetch inside
+	// Show the indicator during the (potentially slow) initial host fetch inside
 	// setup.Open. It animates on stderr only; setup.Open's own work writes to
-	// the protocol stream (stdout) or the debug log, so they do not collide.
-	s.startSpinner("contacting host")
+	// the protocol stream (stdout) or, through s.spin, the cleared stderr.
+	s.spin.Phase("contacting host")
 	sess, err := setup.Open(s.remoteName, s.url, s.stderr, "helper")
 	if err != nil {
 		return err
@@ -224,17 +228,6 @@ func (s *session) ensure() error {
 	return nil
 }
 
-// startSpinner lazily creates the spinner (honoring git's progress option, or a
-// TTY check when git did not send one) and sets its first phase label. A
-// disabled spinner is a no-op, so this is safe to call unconditionally.
-func (s *session) startSpinner(label string) {
-	if s.spin == nil {
-		want := s.progress || !s.progressSet
-		s.spin = progress.New(s.stderr, want)
-	}
-	s.spin.Phase(label)
-}
-
 // handleList answers a "list"/"list for-push" command: it computes the ref
 // advertisement and writes each line plus the terminating blank line to out.
 func (s *session) handleList(out *bufio.Writer, forPush bool) error {
@@ -242,6 +235,9 @@ func (s *session) handleList(out *bufio.Writer, forPush bool) error {
 	if err != nil {
 		return err
 	}
+	// Clear the indicator before the ref advertisement: an up-to-date push sends
+	// no push batch, so git prints its summary to the terminal right after this.
+	s.spin.Stop()
 	for _, l := range lines {
 		fmt.Fprintln(out, l)
 	}

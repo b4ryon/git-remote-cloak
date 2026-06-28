@@ -1,10 +1,16 @@
-// Package progress renders a lightweight, single-line braille spinner on a
-// writer (cloak's stderr) so a slow `git push`/`git fetch` shows a live
-// "still working" cue with the current phase and elapsed time. It is purely
-// cosmetic: it never touches the remote-helper stdout protocol, the
-// on-disk/on-wire format, or the crypto. When disabled - the writer is not a
-// terminal, or git did not ask for progress - every method is a no-op, so
+// Package progress renders a lightweight, single-line braille progress
+// indicator on a writer (cloak's stderr) so a slow `git push`/`git fetch`
+// shows a live "still working" cue with the current phase and elapsed time.
+// It is purely cosmetic: it never touches the remote-helper stdout protocol,
+// the on-disk/on-wire format, or the crypto. When disabled - the writer is not
+// a terminal, or git did not ask for progress - it is inert, so
 // non-interactive runs (launchd, cron, pipes, --quiet) print nothing.
+//
+// The Spinner also implements io.Writer: the helper routes ALL of its stderr
+// (logs and error messages) through it, so any such output erases a live
+// indicator line first and never glues onto it. Output from git itself (a
+// separate process writing the same terminal) cannot be intercepted, so the
+// helper additionally clears the indicator before handing control back to git.
 package progress
 
 import (
@@ -18,22 +24,26 @@ import (
 )
 
 // frames is the 10-step braille "dots" wheel (Unicode U+280B..U+280F) - the
-// smooth single-cell spinner used by tools like opencode. The glyphs are
+// smooth single-cell indicator used by tools like opencode. The glyphs are
 // literal UTF-8; a terminal that lacks braille glyphs is the user's font
-// problem, not a correctness one, since the spinner is cosmetic.
+// problem, not a correctness one, since the indicator is cosmetic.
 var frames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 
 // interval is the redraw period; ~100ms reads as smooth without busy-spinning.
 const interval = 100 * time.Millisecond
 
-// Spinner animates a one-line "<braille> <label>  <elapsed>" status on w. The
-// zero value is not usable; construct with New. A nil *Spinner is a valid
-// no-op receiver, so callers need not branch on whether progress is wanted.
+// clearLine returns the cursor to column 0 and erases to end of line.
+const clearLine = "\r\033[K"
+
+// Spinner animates a one-line "<braille> <label>  <elapsed>" status on out, and
+// proxies plain writes to out (clearing the live line first). The zero value is
+// not usable; construct with New. A nil *Spinner is a valid no-op receiver.
 type Spinner struct {
-	w       io.Writer
-	enabled bool
+	out   io.Writer
+	isTTY bool
 
 	mu      sync.Mutex
+	want    bool // git's "option progress"; default true (animate when on a TTY)
 	label   string
 	started time.Time
 	running bool
@@ -41,15 +51,17 @@ type Spinner struct {
 	done    chan struct{}
 }
 
-// New returns a Spinner that draws to w only when want is true AND w is a
-// terminal; otherwise it returns a disabled spinner whose methods all no-op.
-func New(w io.Writer, want bool) *Spinner {
-	return &Spinner{w: w, enabled: want && isTerminal(w)}
+// New returns a Spinner over out (cloak's real terminal stderr). It animates
+// only when out is a terminal and progress is wanted (see SetWant; wanted by
+// default). Route the helper's stderr through the returned Spinner via Write so
+// log and error output never collides with a live indicator line.
+func New(out io.Writer) *Spinner {
+	return &Spinner{out: out, isTTY: isTerminal(out), want: true}
 }
 
-// isTerminal reports whether w is a real TTY (an *os.File backed by one). A
-// non-dumb terminal is required because the spinner uses carriage-return and
-// erase-line control sequences to redraw in place.
+// isTerminal reports whether w is a real, non-dumb TTY (an *os.File backed by
+// one). The indicator needs carriage-return / erase-line control sequences to
+// redraw in place, so a non-terminal or TERM=dumb writer disables animation.
 func isTerminal(w io.Writer) bool {
 	f, ok := w.(*os.File)
 	if !ok {
@@ -61,15 +73,45 @@ func isTerminal(w io.Writer) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-// Phase sets the status label shown next to the spinner, starting the animation
-// on first use. Subsequent calls just change the label; the elapsed clock keeps
-// running from the first Phase so the user sees total operation time.
+// SetWant enables or disables the animation, mirroring git's "option progress".
+// It does not affect passthrough Write.
+func (s *Spinner) SetWant(want bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.want = want
+	s.mu.Unlock()
+}
+
+// Write proxies p to the underlying writer, first erasing any live indicator
+// line so log or error output never glues onto it; the animation repaints on
+// its next tick. Implementing io.Writer lets the helper send all of its stderr
+// through the Spinner.
+func (s *Spinner) Write(p []byte) (int, error) {
+	if s == nil {
+		return len(p), nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		fmt.Fprint(s.out, clearLine)
+	}
+	return s.out.Write(p)
+}
+
+// Phase sets the status label, starting the animation on first use when
+// enabled. Later calls just change the label; the elapsed clock keeps running
+// from the first Phase so the user sees total operation time.
 func (s *Spinner) Phase(label string) {
-	if s == nil || !s.enabled {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.isTTY || !s.want {
+		return
+	}
 	s.label = label
 	if s.running {
 		return
@@ -85,7 +127,7 @@ func (s *Spinner) Phase(label string) {
 // so the next writer (git's own push/fetch summary) starts clean. Safe to call
 // repeatedly and when never started.
 func (s *Spinner) Stop() {
-	if s == nil || !s.enabled {
+	if s == nil {
 		return
 	}
 	s.mu.Lock()
@@ -101,8 +143,7 @@ func (s *Spinner) Stop() {
 }
 
 // loop redraws the current frame every interval until stop is closed, then
-// clears the line and signals done. It owns no state beyond the frame index;
-// the label and start time are read under the mutex in draw.
+// clears the line and signals done.
 func (s *Spinner) loop(stop, done chan struct{}) {
 	defer close(done)
 	t := time.NewTicker(interval)
@@ -121,20 +162,23 @@ func (s *Spinner) loop(stop, done chan struct{}) {
 	}
 }
 
-// draw paints one frame: "\r" to column 0, erase-to-end-of-line, then the
-// glyph, label, and elapsed time, with no trailing newline so the line is
-// overwritten in place on the next tick.
+// draw paints one frame in place (no trailing newline) under the mutex, so it
+// never interleaves with a concurrent passthrough Write.
 func (s *Spinner) draw(i int) {
 	s.mu.Lock()
-	label, started := s.label, s.started
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return
+	}
 	frame := frames[i%len(frames)]
-	fmt.Fprintf(s.w, "\r\033[K%c %s  %s", frame, label, humanDuration(time.Since(started)))
+	fmt.Fprintf(s.out, "%s%c %s  %s", clearLine, frame, s.label, humanDuration(time.Since(s.started)))
 }
 
-// clear erases the spinner line and returns the cursor to column 0.
+// clear erases the indicator line and returns the cursor to column 0.
 func (s *Spinner) clear() {
-	fmt.Fprint(s.w, "\r\033[K")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fmt.Fprint(s.out, clearLine)
 }
 
 // humanDuration renders elapsed time compactly: "5s" under a minute, "1m05s"
