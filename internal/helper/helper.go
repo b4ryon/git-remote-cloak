@@ -18,6 +18,7 @@ import (
 	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/engine"
 	"github.com/b4ryon/git-remote-cloak/internal/logx"
+	"github.com/b4ryon/git-remote-cloak/internal/progress"
 	"github.com/b4ryon/git-remote-cloak/internal/setup"
 )
 
@@ -40,6 +41,13 @@ type session struct {
 	verbosity int
 	dryRun    bool
 	forceAll  bool
+
+	// progress mirrors git's "option progress" (whether to show a live spinner
+	// on stderr); progressSet records whether git sent it, so an unset option
+	// falls back to a TTY check rather than defaulting to silent.
+	progress    bool
+	progressSet bool
+	spin        *progress.Spinner
 
 	ready bool
 }
@@ -149,6 +157,7 @@ func collectBatch(in *bufio.Scanner, first, prefix string) ([]string, error) {
 // fatal reports a classified error on stderr (the protocol-blessed path for
 // fatal failures) and returns the exit code.
 func (s *session) fatal(err error) int {
+	s.spin.Stop() // clear the spinner line so the error prints clean
 	fmt.Fprintln(s.stderr, cloakerr.Message(err))
 	// Point at the per-repo debug log for self-service troubleshooting. The
 	// concrete path is only known once the session's state dir is open; before
@@ -178,6 +187,8 @@ func (s *session) option(rest string) string {
 		_, _ = fmt.Sscanf(value, "%d", &s.verbosity)
 		return "ok"
 	case "progress":
+		s.progress = value == "true"
+		s.progressSet = true
 		return "ok"
 	case "dry-run":
 		s.dryRun = value == "true"
@@ -196,6 +207,10 @@ func (s *session) ensure() error {
 	if s.ready {
 		return nil
 	}
+	// Start the spinner before the (potentially slow) initial host fetch inside
+	// setup.Open. It animates on stderr only; setup.Open's own work writes to
+	// the protocol stream (stdout) or the debug log, so they do not collide.
+	s.startSpinner("contacting host")
 	sess, err := setup.Open(s.remoteName, s.url, s.stderr, "helper")
 	if err != nil {
 		return err
@@ -204,8 +219,20 @@ func (s *session) ensure() error {
 	s.eng = sess.Eng
 	s.rs = sess.RS
 	s.log = sess.Log
+	s.eng.Progress = s.spin // drive per-phase labels during fetch/push
 	s.ready = true
 	return nil
+}
+
+// startSpinner lazily creates the spinner (honoring git's progress option, or a
+// TTY check when git did not send one) and sets its first phase label. A
+// disabled spinner is a no-op, so this is safe to call unconditionally.
+func (s *session) startSpinner(label string) {
+	if s.spin == nil {
+		want := s.progress || !s.progressSet
+		s.spin = progress.New(s.stderr, want)
+	}
+	s.spin.Phase(label)
 }
 
 // handleList answers a "list"/"list for-push" command: it computes the ref
@@ -319,6 +346,7 @@ func (s *session) fetchBatch(reqs []string) ([]string, error) {
 		return nil, err
 	}
 	s.log.Info("fetch batch complete", "objects", len(reqs), "locks", len(locks))
+	s.spin.Stop() // clear the spinner line before the protocol response
 	return locks, nil
 }
 
@@ -385,10 +413,12 @@ func (s *session) pushBatch(specs []string) ([]engine.RefResult, error) {
 		return nil, err
 	}
 	s.rs = newRS
+	s.spin.Stop() // clear the spinner line before the protocol response
 	return results, nil
 }
 
 func (s *session) cleanup() {
+	s.spin.Stop() // catch-all: clear any spinner left running (list-only, EOF)
 	if s.sess != nil {
 		s.sess.Close()
 	}

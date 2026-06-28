@@ -141,6 +141,7 @@ func (e *Engine) retryAfterCASLost(attempt int) (pushAttempt, error) {
 	// Warn (not Info) so the user sees progress on stderr: a contended push
 	// otherwise looks like a silent hang while it retries.
 	e.Log.Warn("compare-and-swap lost; re-fetching and retrying", "attempt", attempt)
+	e.phase("remote changed, retrying")
 	next, err := e.LoadRemoteState()
 	if err != nil {
 		return pushAttempt{}, err
@@ -198,6 +199,7 @@ func (e *Engine) commitAndExecute(cur *RemoteState, plan *pushPlan, squash bool,
 		return 0, builtCommit{}, err
 	}
 	holdHook(attempt)
+	e.phase("uploading to host")
 	if squash {
 		e.Log.Info("geometric consolidation triggered; squashing backend chain",
 			"generation", plan.man.Generation, "live_packs", len(plan.man.Packs))
@@ -514,6 +516,7 @@ func (e *Engine) buildSinglePack(stdin string) (builtPack, error) {
 		return builtPack{}, err
 	}
 	sniff := &packHeadSniffer{dst: pw}
+	e.phase("encrypting pack")
 	if err := e.streamPack(pw, gitx.Opts{GitDir: e.LocalGitDir,
 		Stdin:  strings.NewReader(stdin),
 		Stdout: sniff},
@@ -542,6 +545,7 @@ func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64) (
 	defer func() { _ = os.RemoveAll(scratch) }()
 
 	base := filepath.Join(scratch, "pack")
+	e.phase("splitting oversized push")
 	if _, _, err := e.G.Run(gitx.Opts{GitDir: e.LocalGitDir, Stdin: strings.NewReader(stdin)},
 		"pack-objects", "--revs", "--delta-base-offset",
 		"--max-pack-size", strconv.FormatInt(budget, 10), base); err != nil {
@@ -559,7 +563,8 @@ func (e *Engine) splitEncryptPacks(stdin string, wants []string, budget int64) (
 			_ = os.Remove(p.path)
 		}
 	}
-	for _, pf := range plainPacks {
+	for i, pf := range plainPacks {
+		e.phase("encrypting pack %d/%d", i+1, len(plainPacks))
 		pp, err := e.encryptPackFile(pf)
 		if err != nil {
 			cleanup()

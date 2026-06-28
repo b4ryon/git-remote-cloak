@@ -36,6 +36,25 @@ type Engine struct {
 	Key         keystore.Key
 	Cfg         config.Config
 	Log         *slog.Logger
+	// Progress, when set, receives coarse phase labels for a live UI spinner
+	// (push/fetch). nil = silent, so non-helper callers (CLI, tests) need not
+	// supply one. It is purely cosmetic and never affects correctness.
+	Progress Progress
+}
+
+// Progress receives the human-readable label of the engine's current slow
+// phase ("uploading to host", "applying pack 2/5", ...). The helper backs it
+// with a terminal spinner; the engine calls it through the nil-safe phase
+// helper so a nil Progress is a no-op.
+type Progress interface {
+	Phase(label string)
+}
+
+// phase reports the current slow phase to e.Progress, if any. Cosmetic only.
+func (e *Engine) phase(format string, args ...any) {
+	if e.Progress != nil {
+		e.Progress.Phase(fmt.Sprintf(format, args...))
+	}
 }
 
 // RemoteState is the validated view of the remote after one fetch.
@@ -66,6 +85,7 @@ func ciphertextHash(ct []byte) string {
 // a valid manifest while withholding or corrupting its packs cannot move the
 // pin off honest state.
 func (e *Engine) LoadRemoteState() (*RemoteState, error) {
+	e.phase("downloading from host")
 	head, empty, err := e.Be.Fetch()
 	if err != nil {
 		return nil, err
@@ -205,10 +225,12 @@ func (e *Engine) FetchApply(rs *RemoteState) (keepFiles []string, err error) {
 // as it goes so a later pack's predecessor check sees earlier packs.
 func (e *Engine) applyManifestPacks(rs *RemoteState, applied map[string]bool) (keepFiles, newlyApplied []string, err error) {
 	closure := e.lazyClosure(rs.Manifest.Refs)
-	for _, p := range rs.Manifest.Packs {
+	total := len(rs.Manifest.Packs)
+	for i, p := range rs.Manifest.Packs {
 		if applied[p.ID] {
 			continue
 		}
+		e.phase("applying pack %d/%d", i+1, total)
 		keep, err := e.downloadUnlessSkippable(rs.Head, p, applied, closure)
 		if err != nil {
 			return nil, nil, err

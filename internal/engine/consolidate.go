@@ -23,6 +23,7 @@ import (
 // the new pack carries Replaces so up-to-date clients skip the download,
 // and the resulting push becomes a squash.
 func (e *Engine) consolidate(cur *RemoteState, plan *pushPlan, victims []manifest.Pack) error {
+	e.phase("consolidating packs")
 	scratch, err := os.MkdirTemp(e.St.TmpDir(), "scratch-")
 	if err != nil {
 		return fmt.Errorf("create consolidation scratch dir: %w", err)
