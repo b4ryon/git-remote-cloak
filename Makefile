@@ -54,6 +54,10 @@ install: check-go build
 	install -d $(PREFIX)
 	install $(BIN)/git-remote-cloak $(PREFIX)/git-remote-cloak
 	ln -sf git-remote-cloak $(PREFIX)/git-cloak
+	@if [ "$(CLOAK_SIGN_ID)" != "-" ]; then \
+		echo "codesign --sign $(CLOAK_SIGN_ID) $(PREFIX)/git-remote-cloak"; \
+		codesign --force --sign "$(CLOAK_SIGN_ID)" $(PREFIX)/git-remote-cloak; \
+	fi
 
 # -count=1 disables the test cache: go test does NOT track the rebuilt helper
 # binary, so a cached integration result can pass against a stale binary.
