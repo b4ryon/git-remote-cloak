@@ -373,6 +373,22 @@ func (d *Dir) CheckRepoID(m *manifest.Manifest) error {
 		return err
 	}
 	if !ok {
+		// No repo-id pin. Genuine first contact (no rollback pin either) is
+		// trust-on-first-use. But a rollback (generation) pin WITHOUT a repo-id
+		// pin is an inconsistent state: SavePins writes the two pins in separate
+		// rename steps, so a crash between them (or a manual deletion) can leave
+		// the generation pinned while the identity pin is gone. Silently TOFUing
+		// here would let a host substitute a different same-key repository at a
+		// higher generation (CheckPin passes on the bump, and the identity then
+		// re-pins to the host's value). Fail closed instead; the explicit
+		// `git cloak accept-repo-change` override clears both pins and re-pins
+		// the current remote (CR-005).
+		if _, hasPin, perr := d.LoadPin(); perr != nil {
+			return perr
+		} else if hasPin {
+			return cloakerr.Newf(cloakerr.Tamper, "remote state",
+				"inconsistent local state: a rollback pin is set but the repo-identity pin is missing (an interrupted state save or a manual deletion); refusing to trust-on-first-use an identity that could differ. Run `git cloak accept-repo-change` to re-pin the current remote, or delete .git/cloak/<remote> to reset")
+		}
 		return nil // trust-on-first-use
 	}
 	if m.RepoID != pinned {

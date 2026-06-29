@@ -117,6 +117,58 @@ func TestCheckPinDecisions(t *testing.T) {
 	}
 }
 
+// TestCheckRepoIDConsistencyCrossCheck is the CR-005 regression: a missing
+// repo-id pin is trust-on-first-use ONLY at genuine first contact (no pins at
+// all). If a rollback (generation) pin exists but the repo-id pin is gone -- the
+// state an interrupted SavePins (or a manual deletion) can leave -- CheckRepoID
+// must fail closed instead of silently re-TOFUing an identity that could differ.
+func TestCheckRepoIDConsistencyCrossCheck(t *testing.T) {
+	rid := strings.Repeat("ab", 16) // repo ids are 32 hex (16 random bytes)
+	m := func(id string) *manifest.Manifest {
+		mm := manifest.New()
+		mm.RepoID = id
+		return mm
+	}
+
+	// True first contact (no pins at all): TOFU accepts.
+	if err := openDir(t).CheckRepoID(m(rid)); err != nil {
+		t.Fatalf("first-contact TOFU rejected: %v", err)
+	}
+
+	// Generation pinned but repo-id pin missing (interrupted SavePins): fail closed.
+	d := openDir(t)
+	if err := d.SavePin(Pin{Generation: 3, ManifestHash: strings.Repeat("aa", 32)}); err != nil {
+		t.Fatal(err)
+	}
+	err := d.CheckRepoID(m(rid))
+	if err == nil {
+		t.Fatal("CheckRepoID TOFU'd an identity while a rollback pin existed (CR-005)")
+	}
+	if k, _ := cloakerr.KindOf(err); k != cloakerr.Tamper {
+		t.Fatalf("inconsistent-state error not Tamper: %v", err)
+	}
+
+	// Both pins present and matching: passes.
+	d2 := openDir(t)
+	if err := d2.SavePin(Pin{Generation: 1, ManifestHash: strings.Repeat("aa", 32)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.SaveRepoID(rid); err != nil {
+		t.Fatal(err)
+	}
+	if err := d2.CheckRepoID(m(rid)); err != nil {
+		t.Fatalf("matching repo id rejected: %v", err)
+	}
+
+	// Clearing both pins (what accept-repo-change does) returns to clean TOFU.
+	if err := d.ClearPin(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CheckRepoID(m(rid)); err != nil {
+		t.Fatalf("TOFU rejected after clearing both pins (accept-repo-change path): %v", err)
+	}
+}
+
 func TestAppliedSet(t *testing.T) {
 	d := openDir(t)
 	set, err := d.AppliedSet()

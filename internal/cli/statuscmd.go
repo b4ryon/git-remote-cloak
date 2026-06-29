@@ -244,9 +244,13 @@ func cmdAcceptRollback(args []string, stdout, stderr io.Writer) int {
 }
 
 // cmdAcceptRepoChange is the explicit, user-presence-gated override for a
-// repository-identity mismatch: it clears the local repo-id pin so the next
-// fetch re-establishes trust-on-first-use. Use only after deliberately
-// re-pointing a remote at a different repository.
+// repository-identity mismatch: it clears the local repo-id pin AND the
+// rollback (generation) pin, then re-pins both from the current remote, so the
+// next fetch re-establishes trust-on-first-use for the new repository. Both are
+// cleared because a different repository has an unrelated generation history
+// (keeping the old one is meaningless and would trip the CR-005 consistency
+// cross-check). Use only after deliberately re-pointing a remote at a different
+// repository.
 func cmdAcceptRepoChange(args []string, stdout, stderr io.Writer) int {
 	return runAccept(acceptSpec{
 		name:        "accept-repo-change",
@@ -264,7 +268,18 @@ func cmdAcceptRepoChange(args []string, stdout, stderr io.Writer) int {
 				fmt.Fprintln(stdout, "No repo id was pinned (nothing to accept).")
 			}
 		},
-		clear: func(sess *setup.Session) error { return sess.St.ClearRepoID() },
+		clear: func(sess *setup.Session) error {
+			if err := sess.St.ClearRepoID(); err != nil {
+				return err
+			}
+			// Also reset the rollback pin: a different repository has an
+			// unrelated generation history, so keeping the old generation pin
+			// would trip the repo-id/generation consistency cross-check (CR-005)
+			// during re-validation and could raise a spurious rollback alarm
+			// against the new repo. CommitPin re-pins both from the accepted
+			// remote; runAcceptOnSession restores both on failure.
+			return sess.St.ClearPin()
+		},
 		accepted: func(sess *setup.Session) {
 			fmt.Fprintf(stdout, "Accepted: now pinned to repo id %s (generation %d).\n",
 				sess.RS.Manifest.RepoID, sess.RS.Manifest.Generation)
