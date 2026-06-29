@@ -490,7 +490,15 @@ func classifyPushResult(stdout, stderr string, runErr error) (res PushResult, ma
 	if runErr == nil {
 		return PushOK, ""
 	}
-	combined := strings.ToLower(stdout + "\n" + stderr)
+	// Strip the host's "remote:" sideband before scanning: a genuine
+	// compare-and-swap loss is reported by the LOCAL git push machinery (not
+	// "remote:"-prefixed), so a hostile host must not be able to inject a CAS
+	// marker (e.g. "non-fast-forward") into a remote: line and force a false
+	// PushCASLost that retries until exhaustion and masks the real error.
+	// (classifyPushFailure deliberately keeps matching the sideband: the worst a
+	// host can do there is mislabel its own rejection as "too large", which is
+	// harmless, and genuine host file-size rejections arrive on remote: lines.)
+	combined := strings.ToLower(gitx.StripServerSideband(stdout) + "\n" + gitx.StripServerSideband(stderr))
 	for _, m := range casLostMarkers {
 		if strings.Contains(combined, m) {
 			return PushCASLost, m
