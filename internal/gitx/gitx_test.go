@@ -38,6 +38,26 @@ func TestGitErrorCarriesStderrAndExit(t *testing.T) {
 	}
 }
 
+func TestRunCapsCapturedStdout(t *testing.T) {
+	// Uncapped (MaxCapture 0, the default) captures the full output.
+	full, _, err := runner().Run(Opts{}, "version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full) <= 4 {
+		t.Skipf("git version output unexpectedly short: %q", full)
+	}
+	// A tiny cap truncates captured stdout to a faithful prefix; the git process
+	// still runs to completion (no error from the short capture).
+	capped, _, err := runner().Run(Opts{MaxCapture: 4}, "version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped) != 4 || !strings.HasPrefix(full, capped) {
+		t.Fatalf("capped stdout = %q (len %d), want a 4-byte prefix of %q", capped, len(capped), full)
+	}
+}
+
 func TestGitDirEnvControl(t *testing.T) {
 	dir := t.TempDir()
 	if out, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {

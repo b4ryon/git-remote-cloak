@@ -98,7 +98,8 @@ func (b *Backend) Fetch() (head string, empty bool, err error) {
 		args = append(args, "--filter="+partialFilter)
 	}
 	args = append(args, "origin")
-	_, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY()}, args...)
+	_, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
+		MaxCapture: maxCapturedTransportBytes}, args...)
 	if err != nil {
 		return b.classifyFetchErr(stderr, err)
 	}
@@ -134,6 +135,15 @@ func (b *Backend) classifyFetchErr(stderr string, err error) (head string, empty
 // per live pack, capped at manifest.maxPacks) yet bounds the read.
 const maxManifestBytes = 1 << 24
 
+// maxCapturedTransportBytes bounds the in-memory stdout/stderr capture for the
+// host-facing git calls (fetch/push and the lazy-fetch blob read). The host
+// relays unbounded remote: progress/sideband on stderr, so without a cap it
+// could grow helper memory without limit; 16 MiB is far beyond any honest
+// transport diagnostics yet bounds a hostile flood. Passed as gitx.Opts
+// MaxCapture; local plumbing leaves it 0 (uncapped) since its output is the
+// user's own repo data.
+const maxCapturedTransportBytes = 1 << 24
+
 // ReadBlobBytes returns the full content of <commit>:<path> (manifest-sized
 // blobs only; packs stream via ReadBlob). The read is bounded to
 // maxManifestBytes; an oversized blob is reported rather than buffered whole.
@@ -157,7 +167,7 @@ func (b *Backend) ReadBlobBytes(commit, path string) ([]byte, error) {
 // fetch once and retries before reporting tamper.
 func (b *Backend) ReadBlob(commit, path string, dst io.Writer) error {
 	cw := &countingWriter{w: dst}
-	_, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw},
+	_, _, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw, MaxCapture: maxCapturedTransportBytes},
 		"cat-file", "blob", commit+":"+path)
 	if err != nil && b.partial && cw.n == 0 {
 		b.log.Warn("blob read failed under partial mirror; retrying with a full fetch", "path", path)
@@ -166,7 +176,7 @@ func (b *Backend) ReadBlob(commit, path string, dst io.Writer) error {
 		if ferr != nil {
 			return ferr // already transport-classified by Fetch
 		}
-		_, _, err = b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw},
+		_, _, err = b.g.Run(gitx.Opts{GitDir: b.gitDir, Stdout: cw, MaxCapture: maxCapturedTransportBytes},
 			"cat-file", "blob", commit+":"+path)
 	}
 	if err != nil {
@@ -410,7 +420,8 @@ func pushArgs(branch, commit, lease string) []string {
 
 func (b *Backend) push(commit, lease string) (PushResult, error) {
 	args := pushArgs(b.branch, commit, lease)
-	stdout, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY()}, args...)
+	stdout, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
+		MaxCapture: maxCapturedTransportBytes}, args...)
 	switch res, marker := classifyPushResult(stdout, stderr, err); res {
 	case PushOK:
 		return PushOK, nil

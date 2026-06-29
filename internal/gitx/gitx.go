@@ -87,6 +87,13 @@ type Opts struct {
 	// or passphrase entry); no default timeout is imposed so a human prompt
 	// is not killed. Ignored when Ctx is set.
 	Interactive bool
+	// MaxCapture bounds how many bytes of captured stdout/stderr Run buffers in
+	// memory (0 = unlimited, the default). Host-facing transport calls set it so
+	// an untrusted host streaming unbounded remote: sideband cannot grow helper
+	// memory without limit; local plumbing leaves it 0 since its output is the
+	// user's own repo data and may legitimately be large. A caller streaming via
+	// Stdout is unaffected (that path is never buffered).
+	MaxCapture int64
 }
 
 // GitError is a non-zero git exit with its captured stderr.
@@ -204,12 +211,17 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdin = o.Stdin
+	// Bound captured output when o.MaxCapture > 0 so a host streaming unbounded
+	// remote: sideband cannot grow helper memory without limit. A caller
+	// streaming via o.Stdout is unaffected; o.MaxCapture == 0 keeps the
+	// historical unbounded capture for local plumbing.
+	var outCap, errCap *cappingWriter
 	if o.Stdout != nil {
 		cmd.Stdout = o.Stdout
 	} else {
-		cmd.Stdout = &outBuf
+		cmd.Stdout, outCap = capture(&outBuf, o.MaxCapture)
 	}
-	cmd.Stderr = &errBuf
+	cmd.Stderr, errCap = capture(&errBuf, o.MaxCapture)
 
 	start := time.Now()
 	runErr := cmd.Run()
@@ -217,6 +229,11 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 
 	stdout = outBuf.String()
 	stderr = errBuf.String()
+	if g.log != nil && (overflowed(outCap) || overflowed(errCap)) {
+		g.log.Warn("git output exceeded capture cap; truncated for classification",
+			"args", strings.Join(args, " "), "cap_bytes", o.MaxCapture,
+			"stdout_capped", overflowed(outCap), "stderr_capped", overflowed(errCap))
+	}
 	exit := 0
 	if runErr != nil {
 		if ee, ok := runErr.(*exec.ExitError); ok {
@@ -237,4 +254,57 @@ func (g *G) Run(o Opts, args ...string) (stdout, stderr string, err error) {
 func (g *G) Out(o Opts, args ...string) (string, error) {
 	stdout, _, err := g.Run(o, args...)
 	return strings.TrimSpace(stdout), err
+}
+
+// capture returns the writer to hand the subprocess for one captured stream and
+// the cappingWriter wrapping it (nil when uncapped). Output is always collected
+// into sink; with limit > 0 it is bounded to limit bytes.
+func capture(sink *bytes.Buffer, limit int64) (io.Writer, *cappingWriter) {
+	if limit <= 0 {
+		return sink, nil
+	}
+	cw := &cappingWriter{w: sink, limit: limit}
+	return cw, cw
+}
+
+// overflowed reports whether a (possibly nil) capping writer dropped output.
+func overflowed(c *cappingWriter) bool { return c != nil && c.overflow }
+
+// cappingWriter forwards to w until limit bytes have been written, then discards
+// the rest and records overflow. It always reports a full write so the git
+// subprocess runs to completion (memory stays bounded by the discard) rather
+// than dying on a short write. Duplicated from internal/backend's identical
+// helper because gitx is the lowest-level package and cannot import backend;
+// keep the two in sync.
+type cappingWriter struct {
+	w        io.Writer
+	n        int64
+	limit    int64
+	overflow bool
+}
+
+func (c *cappingWriter) Write(p []byte) (int, error) {
+	if c.overflow {
+		return len(p), nil
+	}
+	room := c.limit - c.n
+	if room >= int64(len(p)) {
+		if wn, err := c.writeChunk(p); err != nil {
+			return wn, err
+		}
+		return len(p), nil
+	}
+	if room > 0 {
+		if wn, err := c.writeChunk(p[:room]); err != nil {
+			return wn, err
+		}
+	}
+	c.overflow = true
+	return len(p), nil
+}
+
+func (c *cappingWriter) writeChunk(b []byte) (int, error) {
+	wn, err := c.w.Write(b)
+	c.n += int64(wn)
+	return wn, err
 }
