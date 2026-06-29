@@ -335,6 +335,29 @@ func (e *Engine) downloadVerifyPack(head, ctPath string, p manifest.Pack) error 
 	return nil
 }
 
+// verifyReusedPackBlob streams an already-stored pack blob (packs/<id>.age) from
+// the given backend commit and confirms its ciphertext still hashes to its
+// manifest pack id. The push path reuses host-served pack blobs from the current
+// backend tree by OID without re-downloading them (treePackBlobs); without this
+// check a host that swapped a pack blob's content under the same manifest id
+// could be laundered into a freshly signed new generation that every client then
+// fails to fetch (CR-001). This mirrors downloadVerifyPack's fetch-side check
+// but hashes only (no temp file), since the reused blob is not applied locally.
+// ReadBlob streams into the hasher, so memory stays bounded regardless of pack
+// size; the cost is re-reading reused live packs (local I/O, bounded by
+// geometric consolidation keeping the live-pack count ~log(pushes)).
+func (e *Engine) verifyReusedPackBlob(commit, id string) error {
+	hasher := sha256.New()
+	if err := e.Be.ReadBlob(commit, "packs/"+id+".age", hasher); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != id {
+		return cloakerr.Newf(cloakerr.Tamper, "verify reused pack "+id[:12],
+			"ciphertext hash %s does not match manifest id %s", got, id).WithHint(packTamperHint)
+	}
+	return nil
+}
+
 // applyPack downloads packs/<id>.age, verifies and decrypts it, and feeds
 // the plaintext pack to git index-pack in the local repository.
 func (e *Engine) applyPack(head string, p manifest.Pack) (keepFile string, err error) {

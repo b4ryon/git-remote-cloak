@@ -752,6 +752,15 @@ func (e *Engine) treePackBlobs(in commitInput) (map[string]string, error) {
 	}
 	// Keep only blobs for packs still live in the manifest.
 	retainLivePackBlobs(packOIDs, in.man.PackIDs())
+	// Reused blobs come from the host's current tree (in.blobSource), which is
+	// untrusted. Verify each still hashes to its pack id before carrying it into
+	// a freshly signed commit, so a host-corrupted blob cannot be laundered into
+	// a new generation that every client then fails to fetch (CR-001).
+	for id := range packOIDs {
+		if err := e.verifyReusedPackBlob(in.blobSource, id); err != nil {
+			return nil, err
+		}
+	}
 	for _, p := range in.packs {
 		oid, err := e.hashPackBlob(p.path)
 		if err != nil {

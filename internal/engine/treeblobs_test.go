@@ -6,9 +6,12 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 
+	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
@@ -37,4 +40,69 @@ func TestTreePackBlobsRefusesMissingLivePackBlob(t *testing.T) {
 	if _, err := e.treePackBlobs(commitInput{man: &manifest.Manifest{}, blobSource: ""}); err != nil {
 		t.Fatalf("manifest-only tree assembly should succeed, got: %v", err)
 	}
+}
+
+// TestTreePackBlobsVerifiesReusedBlobCiphertext is the CR-001 regression: the
+// push path reuses pack blobs from the host's current backend tree by OID; a
+// host that swapped a blob's content under the same manifest pack id must not be
+// laundered into a freshly signed commit. treePackBlobs must re-hash each reused
+// blob and refuse when the ciphertext no longer matches its pack id.
+func TestTreePackBlobsVerifiesReusedBlobCiphertext(t *testing.T) {
+	g := gitx.New(discard())
+	host := newHostRepo(t, g)
+	key, err := keystore.Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := newMachine(t, g, host, key).e
+
+	manifestOID, err := e.Be.HashObject(strings.NewReader("manifest-ciphertext"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// packID is what the manifest declares; the stored blob's content does NOT
+	// hash to it (the host tampered with the pack blob under the same filename).
+	packID := strings.Repeat("a", 64)
+	corruptOID, err := e.Be.HashObject(strings.NewReader("tampered-ciphertext"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := e.Be.BuildCommit("", manifestOID, map[string]string{packID: corruptOID}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	man := &manifest.Manifest{Packs: []manifest.Pack{{ID: packID, Size: 1}}}
+	_, err = e.treePackBlobs(commitInput{man: man, blobSource: src})
+	if err == nil {
+		t.Fatal("treePackBlobs reused a corrupted pack blob without verifying it")
+	}
+	if kind, ok := cloakerr.KindOf(err); !ok || kind != cloakerr.Tamper {
+		t.Fatalf("reused-blob mismatch not classified Tamper: %v", err)
+	}
+	if !strings.Contains(err.Error(), "does not match manifest id") {
+		t.Fatalf("error lacks ciphertext-mismatch detail: %v", err)
+	}
+
+	// Control: an honestly-stored reused blob (content hashes to its id) passes.
+	good := []byte("honest-ciphertext")
+	goodID := hex.EncodeToString(sha256Sum(good))
+	goodOID, err := e.Be.HashObject(strings.NewReader(string(good)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	src2, err := e.Be.BuildCommit("", manifestOID, map[string]string{goodID: goodOID}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	man2 := &manifest.Manifest{Packs: []manifest.Pack{{ID: goodID, Size: int64(len(good))}}}
+	if _, err := e.treePackBlobs(commitInput{man: man2, blobSource: src2}); err != nil {
+		t.Fatalf("treePackBlobs rejected an honestly-stored reused blob: %v", err)
+	}
+}
+
+func sha256Sum(b []byte) []byte {
+	h := sha256.Sum256(b)
+	return h[:]
 }
