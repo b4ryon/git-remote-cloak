@@ -248,6 +248,15 @@ func (d *Dir) LoadPin() (Pin, bool, error) {
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d %s", &p.Generation, &p.ManifestHash); err != nil {
 		return Pin{}, false, fmt.Errorf("corrupt pin file %s: %w", filepath.Join(d.Root, pinFile), err)
 	}
+	// The pin's manifest hash is a SHA-256 ciphertext digest (ciphertextHash),
+	// always exactly 64 lowercase hex. Reject any other shape as corrupt rather
+	// than silently normalizing it (e.g. a short "deadbeef"), so a malformed or
+	// tampered local pin fails closed instead of being accepted as a valid
+	// rollback anchor and quietly overwritten by the next higher-generation state.
+	if !manifest.IsLowerHex(p.ManifestHash, 64) {
+		return Pin{}, false, fmt.Errorf("corrupt pin file %s: manifest hash is not 64 lowercase hex",
+			filepath.Join(d.Root, pinFile))
+	}
 	return p, true, nil
 }
 

@@ -29,6 +29,7 @@
 package state
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"maps"
@@ -134,14 +135,16 @@ func FuzzCheckPin(f *testing.F) {
 	f.Add(false, false, false, uint64(7), uint64(0), "aa", "")  // emptied remote with a pin -> Rollback
 
 	f.Fuzz(func(t *testing.T, firstContact, mPresent, sameHash bool, pinGen, mGen uint64, hashSeed, mHashSeed string) {
-		// A pin's ManifestHash round-trips through the "generation" file via
-		// fmt.Sscanf("%d %s"), so it must be a single non-empty whitespace-free
-		// token to come back byte-identical; deriving it as hex guarantees that
-		// while keeping the full hashSeed entropy and not restricting the
-		// decision space. The manifest hash (mHash) is passed straight to
-		// CheckPin and never written to disk, so it stays an arbitrary
-		// host-influenced string -- the real attack surface for the tamper check.
-		pinHash := hex.EncodeToString([]byte(hashSeed)) + "0"
+		// A pin's ManifestHash is persisted to the "generation" file and LoadPin
+		// now requires it to be exactly 64 lowercase hex (CR-004, the
+		// ciphertextHash shape), so derive it via SHA-256 of the seed: a
+		// well-formed pin whose decision logic CheckPin actually exercises (a
+		// malformed pin would short-circuit to a corrupt-file error). The
+		// manifest hash (mHash) is passed straight to CheckPin and never written
+		// to disk, so it stays an arbitrary host-influenced string -- the real
+		// attack surface for the tamper check.
+		ph := sha256.Sum256([]byte(hashSeed))
+		pinHash := hex.EncodeToString(ph[:])
 		mHash := mHashSeed
 		if sameHash {
 			mHash = pinHash
@@ -311,10 +314,9 @@ func FuzzLoadPin(f *testing.F) {
 
 		// The file definitely exists (we just wrote it), so ok==false must be
 		// paired with a parse error, and ok==true with a clean parse. A
-		// successful parse must have extracted a non-empty, whitespace-free
-		// hash: Sscanf "%d %s" cannot succeed without both a generation and a
-		// hash token, so a corrupt/truncated file is never accepted as a
-		// zero-generation pin that would slip a rollback past CheckPin.
+		// successful parse must have extracted a generation and a 64-lowercase-hex
+		// manifest hash (CR-004), so a corrupt/truncated/malformed file is never
+		// accepted as a pin that would slip a rollback past CheckPin.
 		assertLoadPinParse(t, raw, p, ok, err)
 
 		// Deterministic: re-reading the unchanged bytes yields the same verdict.
@@ -513,24 +515,26 @@ func assertLoadPinParse(t *testing.T, raw []byte, p Pin, ok bool, err error) {
 			t.Fatalf("LoadPin(%q) returned ok alongside an error: %v", raw, err)
 		}
 	case ok:
-		if p.ManifestHash == "" {
-			t.Fatalf("LoadPin(%q) accepted a pin with an empty hash: %+v", raw, p)
-		}
-		if strings.ContainsAny(p.ManifestHash, " \t\r\n") {
-			t.Fatalf("LoadPin(%q) accepted a hash carrying whitespace: %q", raw, p.ManifestHash)
+		// CR-004: a parsed pin is accepted only when its hash has the exact
+		// SHA-256 shape (64 lowercase hex). This subsumes the old non-empty and
+		// no-whitespace checks and additionally rejects short/long/non-hex tokens
+		// that were previously normalized into a "valid" pin.
+		if !manifest.IsLowerHex(p.ManifestHash, 64) {
+			t.Fatalf("LoadPin(%q) accepted a pin whose hash is not 64 lowercase hex: %q", raw, p.ManifestHash)
 		}
 	default:
 		t.Fatalf("LoadPin(%q) reported no record though the file exists", raw)
 	}
 }
 
-// assertSavedPinRoundTrips pins LoadPin's round-trip faithfulness: any Pin
-// SavePin persists LoadPin recovers byte-identically. The hash is derived as
-// hex so it is a clean, non-empty, whitespace-free token the "%d %s" codec
-// round-trips.
+// assertSavedPinRoundTrips pins LoadPin's round-trip faithfulness: a Pin SavePin
+// persists with a well-formed hash, LoadPin recovers byte-identically. The hash
+// is derived via SHA-256 so it always has the exact 64-lowercase-hex shape
+// LoadPin now requires (CR-004), matching the real ciphertextHash codomain.
 func assertSavedPinRoundTrips(t *testing.T, d *Dir, gen uint64, hashSeed string) {
 	t.Helper()
-	want := Pin{Generation: gen, ManifestHash: hex.EncodeToString([]byte(hashSeed)) + "0"}
+	sum := sha256.Sum256([]byte(hashSeed))
+	want := Pin{Generation: gen, ManifestHash: hex.EncodeToString(sum[:])}
 	if err := d.SavePin(want); err != nil {
 		t.Fatalf("SavePin(%+v): %v", want, err)
 	}

@@ -52,6 +52,33 @@ func TestPinRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLoadPinRejectsMalformedHash(t *testing.T) {
+	for _, bad := range []string{
+		"7 " + strings.Repeat("a", 63), // 63 hex (too short)
+		"7 " + strings.Repeat("a", 65), // 65 hex (too long)
+		"7 " + strings.Repeat("A", 64), // uppercase
+		"7 " + strings.Repeat("g", 64), // non-hex digit
+		"7 deadbeef",                   // short token
+	} {
+		d := openDir(t)
+		if err := os.WriteFile(filepath.Join(d.Root, pinFile), []byte(bad+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := d.LoadPin(); ok || err == nil {
+			t.Fatalf("LoadPin accepted malformed pin %q: ok=%v err=%v", bad, ok, err)
+		}
+	}
+	// Control: a valid 64-hex pin still loads.
+	d := openDir(t)
+	want := Pin{Generation: 5, ManifestHash: strings.Repeat("ab", 32)}
+	if err := d.SavePin(want); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := d.LoadPin(); err != nil || !ok || got != want {
+		t.Fatalf("valid pin failed to load: got=%+v ok=%v err=%v", got, ok, err)
+	}
+}
+
 func TestCheckPinDecisions(t *testing.T) {
 	d := openDir(t)
 	hashA, hashB := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
