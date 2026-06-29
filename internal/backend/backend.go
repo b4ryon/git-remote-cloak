@@ -422,15 +422,27 @@ func (b *Backend) push(commit, lease string) (PushResult, error) {
 	args := pushArgs(b.branch, commit, lease)
 	stdout, stderr, err := b.g.Run(gitx.Opts{GitDir: b.gitDir, Interactive: stdinIsTTY(),
 		MaxCapture: maxCapturedTransportBytes}, args...)
-	switch res, marker := classifyPushResult(stdout, stderr, err); res {
-	case PushOK:
+	if err == nil {
 		return PushOK, nil
-	case PushCASLost:
-		b.log.Info("backend push lost compare-and-swap", "marker", marker)
-		return PushCASLost, nil
-	default:
+	}
+	// A host file-size rejection is a hard failure -- surface it as a clear
+	// TooLarge error -- not a compare-and-swap loss, even though it too renders
+	// as a porcelain "!" rejection, so it is classified BEFORE the CAS check.
+	if hostFileLimitRejection(stdout, stderr) {
 		return PushFailed, classifyPushFailure(stdout, stderr, err)
 	}
+	// A porcelain "!" rejection line for our branch means the host received the
+	// push and refused the ref update. The backend branch only ever moves via a
+	// cloak push, so any ref refusal (server-side mid-connection, or git's own
+	// stale-advertisement check) can only mean the branch advanced since
+	// discovery: a lost compare-and-swap. Re-fetch and retry.
+	if backendRefRejected(stdout, b.branch) {
+		b.log.Info("backend push lost compare-and-swap")
+		return PushCASLost, nil
+	}
+	// No ref-level rejection line: the transport failed before git could report
+	// per-ref status (host unreachable, auth failure, dropped connection).
+	return PushFailed, classifyPushFailure(stdout, stderr, err)
 }
 
 // hostFileLimitMarkers are substrings a host prints when it refuses a push
@@ -459,50 +471,68 @@ var hostFileLimitMarkers = []string{
 // its own push rejection as "too large", which leaks nothing and (unlike the
 // integrity read path) cannot downgrade a security class.
 func classifyPushFailure(stdout, stderr string, err error) error {
-	combined := strings.ToLower(stdout + "\n" + stderr)
-	for _, m := range hostFileLimitMarkers {
-		if strings.Contains(combined, m) {
-			return cloakerr.New(cloakerr.TooLarge, "push backend branch", err).WithHint(
-				"the host refused the push because an encrypted pack exceeds its per-file size limit (GitHub: 100 MiB); cloak stores each pack as one file, so shrink or remove the large file(s) and re-commit, or set `git config cloak.maxPackBytes` to catch this before upload")
-		}
+	if hostFileLimitRejection(stdout, stderr) {
+		return cloakerr.New(cloakerr.TooLarge, "push backend branch", err).WithHint(
+			"the host refused the push because an encrypted pack exceeds its per-file size limit (GitHub: 100 MiB); cloak stores each pack as one file, so shrink or remove the large file(s) and re-commit, or set `git config cloak.maxPackBytes` to catch this before upload")
 	}
 	return gitx.ClassifyTransport("push backend branch", err)
 }
 
-// casLostMarkers are the substrings git prints (to stdout or stderr) when a push
-// loses the compare-and-swap: the remote branch moved between discovery and the
-// update, so the helper must re-fetch and retry rather than report a hard
-// failure. The match is case-insensitive (the combined output is lowercased
-// first), so these are written in lower case.
-var casLostMarkers = []string{
-	"non-fast-forward", "fetch first", "stale info",
-	"cannot lock ref", "failed to update ref",
-}
-
-// classifyPushResult maps a backend push's outcome to a PushResult. runErr is
-// the error git's push returned (nil means it succeeded, which short-circuits
-// to PushOK before any output is scanned). On failure it scans the combined
-// lowercased stdout/stderr for the first compare-and-swap-lost marker; the
-// returned marker names the matched one (empty unless the result is
-// PushCASLost) so the caller can log which signal it saw. A PushFailed result
-// carries no marker and lets the caller classify the transport error.
-func classifyPushResult(stdout, stderr string, runErr error) (res PushResult, marker string) {
-	if runErr == nil {
-		return PushOK, ""
-	}
-	// Strip the host's "remote:" sideband before scanning: a genuine
-	// compare-and-swap loss is reported by the LOCAL git push machinery (not
-	// "remote:"-prefixed), so a hostile host must not be able to inject a CAS
-	// marker (e.g. "non-fast-forward") into a remote: line and force a false
-	// PushCASLost that retries until exhaustion and masks the real error.
-	// (classifyPushFailure deliberately keeps matching the sideband: the worst a
-	// host can do there is mislabel its own rejection as "too large", which is
-	// harmless, and genuine host file-size rejections arrive on remote: lines.)
-	combined := strings.ToLower(gitx.StripServerSideband(stdout) + "\n" + gitx.StripServerSideband(stderr))
-	for _, m := range casLostMarkers {
+// hostFileLimitRejection reports whether the combined push output shows the host
+// refused a pack blob for exceeding its per-file size limit. Matching the host's
+// "remote:" sideband is intentional and safe (see classifyPushFailure): the
+// worst a hostile host can do is mislabel its own rejection as "too large",
+// which leaks nothing and only changes the surfaced error message, and genuine
+// host file-size rejections do arrive on "remote:" lines.
+func hostFileLimitRejection(stdout, stderr string) bool {
+	combined := strings.ToLower(stdout + "\n" + stderr)
+	for _, m := range hostFileLimitMarkers {
 		if strings.Contains(combined, m) {
-			return PushCASLost, m
+			return true
 		}
 	}
-	return PushFailed, ""
+	return false
+}
+
+// backendRefRejected reports whether git's --porcelain push output (stdout)
+// carries a rejection line for our backend branch. The porcelain status format
+// is
+//
+//	<flag> TAB <from>:<to> TAB <summary>
+//
+// and git renders a refused ref update with a "!" flag whatever the host's
+// reason. That flag and the line structure are produced LOCALLY by git's push
+// machinery, so -- unlike the parenthesised reason text, which is relayed
+// verbatim from the untrusted host -- a hostile host can neither forge a "!" to
+// trigger a spurious retry nor suppress one to mask a genuine compare-and-swap
+// loss. Only stdout is scanned (the host's "remote:" sideband lands on stderr
+// and never begins with "!\t"), and the match is anchored to our branch's "to"
+// ref so an unrelated ref's status never counts. The earlier marker-substring
+// scan was replaced because a server-side mid-connection rejection reports its
+// reason ("cannot lock ref ...") only on a "remote:" line, which the
+// sideband-stripping anti-spoofing guard correctly discarded -- leaving no
+// marker and misclassifying the lost CAS as a hard failure.
+func backendRefRejected(porcelainStdout, branch string) bool {
+	want := "refs/heads/" + branch
+	for _, line := range strings.Split(porcelainStdout, "\n") {
+		if !strings.HasPrefix(line, "!\t") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 2 {
+			continue
+		}
+		// fields[1] is "<from>:<to>"; the pushed "to" ref is the suffix after
+		// the last colon (a from-oid never contains one). A field with no colon
+		// is malformed porcelain and ignored.
+		spec := fields[1]
+		i := strings.LastIndex(spec, ":")
+		if i < 0 {
+			continue
+		}
+		if spec[i+1:] == want {
+			return true
+		}
+	}
+	return false
 }

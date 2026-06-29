@@ -33,28 +33,48 @@ func TestClassifyPushFailureFallsThrough(t *testing.T) {
 	}
 }
 
-func TestClassifyPushResultGenuineCASLost(t *testing.T) {
-	// A genuine compare-and-swap loss is reported by LOCAL git (not remote:).
-	stderr := "! [rejected]        cloak -> cloak (non-fast-forward)\n" +
-		"error: failed to push some refs to 'origin'"
-	ge := &gitx.GitError{Args: []string{"push"}, ExitCode: 1, Stderr: stderr}
-	if res, marker := classifyPushResult("", stderr, ge); res != PushCASLost {
-		t.Fatalf("genuine non-fast-forward not classified PushCASLost: res=%v marker=%q", res, marker)
+func TestBackendRefRejectedPorcelainFlag(t *testing.T) {
+	// git --porcelain renders a refused ref update with a leading "!" flag and a
+	// "<from>:<to>" spec on stdout -- a genuine LOCAL compare-and-swap signal,
+	// whatever reason the host relays. Both a server-side mid-connection
+	// rejection and git's own stale-advertisement check produce it.
+	for name, stdout := range map[string]string{
+		"server-side": "To origin\n" +
+			"!\t9e90bca:refs/heads/cloak\t[remote rejected] (failed to update ref)\nDone",
+		"client-side": "To origin\n" +
+			"!\t9e90bca:refs/heads/cloak\t[rejected] (stale info)\nDone",
+		// The reason text is git-version/host dependent; detection must not
+		// depend on it (this reason matches none of the old marker phrases --
+		// exactly the case that regressed the marker scan in CI).
+		"reason-independent": "To origin\n" +
+			"!\t9e90bca:refs/heads/cloak\t[remote rejected] (cannot update the ref right now)\nDone",
+	} {
+		if !backendRefRejected(stdout, "cloak") {
+			t.Fatalf("%s: porcelain '!' rejection for our branch not detected", name)
+		}
 	}
 }
 
-func TestClassifyPushResultIgnoresSidebandMarker(t *testing.T) {
-	// A host that injects a CAS marker only inside its own "remote:" sideband
-	// must NOT force a false PushCASLost (which would retry until exhaustion and
-	// mask the real error); the genuine failure here is a transport error.
-	stderr := "remote: non-fast-forward, stale info, cannot lock ref - just kidding\n" +
-		"fatal: unable to access 'https://x/': Could not resolve host: example.invalid"
-	ge := &gitx.GitError{Args: []string{"push"}, ExitCode: 128, Stderr: stderr}
-	res, marker := classifyPushResult("", stderr, ge)
-	if res == PushCASLost {
-		t.Fatalf("sideband-only CAS marker forced PushCASLost (marker=%q)", marker)
+func TestBackendRefRejectedIgnoresSideband(t *testing.T) {
+	// A hostile host cannot forge a rejection: CAS phrases in its "remote:"
+	// sideband never begin with "!\t", and stderr is not scanned at all. With no
+	// genuine porcelain "!" line for our branch this is not a CAS loss, so the
+	// push surfaces the real (transport) failure instead of retrying to
+	// exhaustion. Stdout here is deliberately adversarial (host text never
+	// reaches stdout in practice) to show the flag itself cannot be spoofed.
+	stdout := "remote: !\t<oid>:refs/heads/cloak\t[rejected] (non-fast-forward)\n" +
+		"remote: cannot lock ref, stale info, fetch first - just kidding\n" +
+		"To origin\nDone"
+	if backendRefRejected(stdout, "cloak") {
+		t.Fatal("host-forged sideband rejection must not count as a CAS loss")
 	}
-	if res != PushFailed {
-		t.Fatalf("want PushFailed for a sideband-only marker, got res=%v", res)
+}
+
+func TestBackendRefRejectedOtherBranch(t *testing.T) {
+	// A rejection for an unrelated ref must not be read as our branch's CAS loss.
+	stdout := "To origin\n" +
+		"!\t<oid>:refs/heads/not-cloak\t[rejected] (non-fast-forward)\nDone"
+	if backendRefRejected(stdout, "cloak") {
+		t.Fatal("unrelated ref rejection misattributed to our branch")
 	}
 }

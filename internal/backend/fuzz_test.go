@@ -29,15 +29,14 @@
 // --force-with-lease carrying an explicit expected old value. The existing unit
 // test pins this for one fixed (branch, commit) and two leases; the fuzz target
 // generalizes it over arbitrary, adversarial branch/commit/lease.
-// classifyPushResult is the write-side completion of that surface: it maps a
-// backend push's host-relayed stdout/stderr to PushOK / PushCASLost (re-fetch
-// and retry) / PushFailed -- the push-path sibling of the read-path classifiers
-// classifyBlobRead and classifyFetchErr. Its load-bearing contract is that
-// PushOK is returned only when git itself reported no error (the engine commits
-// and persists a push only on PushOK, so a spurious PushOK would record a
-// publish that never landed), and that the compare-and-swap-lost retry fires
-// exactly on git's documented rejection phrases; the fuzz target pins both over
-// arbitrary, adversarial host output.
+// backendRefRejected is the write-side completion of that surface: it decides
+// whether git's --porcelain push stdout shows our backend branch's ref update
+// was refused (a lost compare-and-swap to re-fetch and retry) -- the push-path
+// sibling of the read-path classifiers classifyBlobRead and classifyFetchErr.
+// Its load-bearing security contract is that only git's LOCAL "!" rejection flag
+// for our branch counts: host-relayed text (the "remote:" sideband, the
+// parenthesised reason) can neither forge a retry nor mask a genuine loss. The
+// fuzz target pins that contract over arbitrary, adversarial host output.
 package backend
 
 import (
@@ -569,108 +568,63 @@ func assertLeaseForce(t *testing.T, args []string, branch, lease string) {
 	}
 }
 
-// FuzzClassifyPushResult pins classifyPushResult, which maps a backend push's
-// outcome (git's stdout, stderr, and run error) to PushOK / PushCASLost /
-// PushFailed. The classification is host-influenced: a remote's rejection is
-// relayed through git's stderr, so an adversarial or noisy host fully controls
-// the scanned text. The oracle re-derives the result with an independent forward
-// scan over a literal copy of the documented compare-and-swap-lost phrases (so
-// an accidental edit to the production marker set diverges and fails here, and
-// the re-scan catches a dropped lowercase, a reordered/short-circuited loop, or
-// a wrong returned marker). The headline safety property -- PushOK is returned
-// IF AND ONLY IF git reported no error -- is asserted independently of the
-// marker set, because the engine commits a push only on PushOK so a spurious
-// success would record a publish that never landed.
-func FuzzClassifyPushResult(f *testing.F) {
-	f.Add("", "", false)                                            // success: no output, no error
-	f.Add("", "", true)                                             // bare failure, no recognizable marker
-	f.Add("", "! [rejected] main -> main (non-fast-forward)", true) // real git rejection on stderr
-	f.Add("STALE INFO", "", true)                                   // uppercased marker -> case-insensitive match
-	f.Add("error: failed to update ref refs/heads/main", "", true)  // marker embedded in noise
-	f.Add("fetch first\nstale info", "", true)                      // two markers, first one wins
-	f.Add("fatal: unable to access remote", "", true)               // genuine failure, not a CAS loss
-	f.Add("", "cannot lock ref refs/heads/cloak", true)             // marker on stderr only
+// FuzzBackendRefRejected pins backendRefRejected, which decides from git's
+// --porcelain push stdout whether our backend branch's ref update was refused (a
+// lost compare-and-swap). The reason text on each status line is relayed
+// verbatim from an adversarial host, so the target asserts the security contract
+// directly: a rejection counts only when a line genuinely begins with git's
+// local "!" flag AND its "<from>:<to>" spec names our branch -- and stripping
+// every such "!\t" line (all that remains is host-relayed or unrelated text)
+// must always read as no rejection, so a host cannot forge one.
+func FuzzBackendRefRejected(f *testing.F) {
+	f.Add("To origin\n!\t9e90:refs/heads/cloak\t[remote rejected] (failed to update ref)\nDone", "cloak")
+	f.Add("To origin\n \t9e90:refs/heads/cloak\t04a1..4b5a\nDone", "cloak") // accepted, space flag
+	f.Add("!\tabc:refs/heads/other\t[rejected] (non-fast-forward)", "cloak") // unrelated ref
+	f.Add("remote: !\tx:refs/heads/cloak\t[rejected] (stale info)\nDone", "cloak") // forged sideband
+	f.Add("", "cloak")
+	f.Add("!\t:refs/heads/cloak\tx", "cloak")        // empty from-oid
+	f.Add("!\trefs/heads/cloak\tx", "cloak")         // malformed: no colon
+	f.Add("!\ta:refs/heads/a:b\tx", "a:b")           // colon in branch name
 
-	f.Fuzz(func(t *testing.T, stdout, stderr string, hasErr bool) {
-		// wantMarkers mirrors the documented git compare-and-swap-lost phrases
-		// independently of the production casLostMarkers slice.
-		wantMarkers := []string{
-			"non-fast-forward", "fetch first", "stale info",
-			"cannot lock ref", "failed to update ref",
-		}
+	f.Fuzz(func(t *testing.T, stdout, branch string) {
+		got := backendRefRejected(stdout, branch)
 
-		var runErr error
-		if hasErr {
-			runErr = errors.New("git push failed")
-		}
-
-		res, marker := classifyPushResult(stdout, stderr, runErr)
-
-		assertPushResultOracle(t, stdout, stderr, runErr, res, marker, wantMarkers)
-
-		// (2) Load-bearing safety, asserted independently of the marker set:
-		// PushOK IFF git reported no error. The engine commits/persists a push
-		// only on PushOK, so a PushOK on a failed push would record a publish that
-		// never landed, and a CAS loss or failure must never masquerade as success.
-		if (res == PushOK) != (runErr == nil) {
-			t.Fatalf("PushOK=%v but (err==nil)=%v: PushOK must mean git reported no error",
-				res == PushOK, runErr == nil)
-		}
-
-		assertPushResultShape(t, res, marker, stdout, stderr, wantMarkers)
-
-		// (4) Pure function: identical inputs yield an identical classification.
-		if res2, marker2 := classifyPushResult(stdout, stderr, runErr); res2 != res || marker2 != marker {
-			t.Fatalf("non-deterministic: (%v, %q) then (%v, %q)", res, marker, res2, marker2)
-		}
-	})
-}
-
-// assertPushResultOracle is classifyPushResult's full-contract forward
-// re-derivation: a nil run error short-circuits to PushOK before any scan;
-// otherwise the FIRST documented marker present in the lowercased combined output
-// (stdout, newline, stderr) wins as PushCASLost, else PushFailed.
-func assertPushResultOracle(t *testing.T, stdout, stderr string, runErr error, res PushResult, marker string, wantMarkers []string) {
-	t.Helper()
-	wantRes, wantMarker := PushFailed, ""
-	if runErr == nil {
-		wantRes, wantMarker = PushOK, ""
-	} else {
-		combined := strings.ToLower(stdout + "\n" + stderr)
-		for _, m := range wantMarkers {
-			if strings.Contains(combined, m) {
-				wantRes, wantMarker = PushCASLost, m
+		// Independent oracle: true iff some line starts with "!\t" and the suffix
+		// after the last colon of its second tab field equals our "to" ref.
+		want := false
+		for _, line := range strings.Split(stdout, "\n") {
+			rest, ok := strings.CutPrefix(line, "!\t")
+			if !ok {
+				continue
+			}
+			spec, _, _ := strings.Cut(rest, "\t")
+			if i := strings.LastIndex(spec, ":"); i >= 0 && spec[i+1:] == "refs/heads/"+branch {
+				want = true
 				break
 			}
 		}
-	}
-	if res != wantRes || marker != wantMarker {
-		t.Fatalf("classifyPushResult(%q, %q, err=%v) = (%v, %q), want (%v, %q)",
-			stdout, stderr, runErr != nil, res, marker, wantRes, wantMarker)
-	}
-}
+		if got != want {
+			t.Fatalf("backendRefRejected(%q, %q) = %v, want %v", stdout, branch, got, want)
+		}
 
-// assertPushResultShape pins that the result is always one of the three defined
-// outcomes, and a marker is set exactly when the result is PushCASLost. When set
-// it is a real documented marker actually present in the lowercased output --
-// never fabricated, since the caller logs it as the observed signal.
-func assertPushResultShape(t *testing.T, res PushResult, marker, stdout, stderr string, wantMarkers []string) {
-	t.Helper()
-	switch res {
-	case PushOK, PushFailed:
-		if marker != "" {
-			t.Fatalf("res %v carries marker %q, want empty", res, marker)
+		// Determinism.
+		if got2 := backendRefRejected(stdout, branch); got2 != got {
+			t.Fatalf("non-deterministic: %v then %v", got, got2)
 		}
-	case PushCASLost:
-		if !slices.Contains(wantMarkers, marker) {
-			t.Fatalf("PushCASLost marker %q is not a documented marker", marker)
+
+		// Security: remove every genuine "!\t" line and no rejection may remain.
+		// Host-relayed text arrives "remote:"-prefixed (never starting "!\t"), so
+		// it can never make backendRefRejected true.
+		var safe []string
+		for _, line := range strings.Split(stdout, "\n") {
+			if !strings.HasPrefix(line, "!\t") {
+				safe = append(safe, line)
+			}
 		}
-		if !strings.Contains(strings.ToLower(stdout+"\n"+stderr), marker) {
-			t.Fatalf("PushCASLost marker %q not present in the output", marker)
+		if backendRefRejected(strings.Join(safe, "\n"), branch) {
+			t.Fatal("rejection detected after removing all '!\\t' lines: host text must not forge a CAS loss")
 		}
-	default:
-		t.Fatalf("undefined PushResult %v", res)
-	}
+	})
 }
 
 // FuzzPackTreeText pins packTreeText, the write-side inverse of parsePackBlobTree.
