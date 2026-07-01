@@ -18,8 +18,9 @@ typed error reporting.
   `git-cloak` for the CLI subcommands).
 - The helper speaks git's remote-helper protocol over stdin/stdout for
   `cloak::` URLs; the `git-cloak` symlink exposes user commands (`version`,
-  `status`, `keygen`, `rekey`, `key export|import|delete`, `accept-rollback`,
-  `accept-repo-change`, and the debug `seed-remote`).
+  `status`, `keygen`, `repack`, `rekey`, `key export|import|delete`,
+  `accept-rollback`, `accept-repo-change`, and the debug
+  `encrypt|decrypt|seed-remote` subcommands).
 
 ## Setup and build commands
 
@@ -53,7 +54,7 @@ a "temp dir is ..." error by design.
 - Race detector over in-process suites: `make test-race`.
 - macOS Keychain backend: `make test-darwin` (build tag `darwinkeystore`).
 - End-to-end suite: `make test-e2e` (build tag `e2e`).
-- Full gate before declaring done: `make check` (vet, vuln, test,
+- Full gate before declaring done: `make check` (vet, lint, vuln, test,
   test-integration, test-darwin).
 
 When fixing a bug, add a regression test that fails against the old code and

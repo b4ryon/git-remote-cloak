@@ -222,10 +222,10 @@ make build              # bin/git-remote-cloak + git-cloak symlink
 make test               # unit tests
 make test-integration   # hermetic integration + security suites (real git)
 make test-race          # race detector across in-process + integration suites
-make test-darwin        # Keychain tests (may prompt Touch ID)
+make test-darwin        # Keychain backend tests
 make vuln               # govulncheck (needs network to the Go vuln database)
 make test-e2e           # live tests against a scratch GitHub repo (CLOAK_E2E=1)
-make check              # vet + vuln + test + test-integration + test-darwin
+make check              # vet + lint + vuln + test + test-integration + test-darwin
 ```
 
 ## Acknowledgments

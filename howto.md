@@ -117,6 +117,7 @@ to retry.
 | cloak.pushRetries | 5 | Concurrent-push retry cap |
 | cloak.branch | cloak | Backend branch name on the host |
 | cloak.logLevel | info | Debug log level |
+| cloak.maxPackBytes | 104857600 | Largest encrypted pack cloak will publish; 0 disables the pre-upload check |
 
 ## Troubleshooting
 
@@ -124,7 +125,7 @@ to retry.
   one command with `CLOAK_LOG=debug git push origin main`.
 - Local helper state is disposable: deleting `.git/cloak/` rebuilds it on
   the next fetch (rollback protection restarts as trust-on-first-use).
-- Sensitive commands (keygen, key export, rekey, accept-rollback) prompt
+- Sensitive commands (keygen, key export, rekey, accept-rollback, accept-repo-change) prompt
   Touch ID only in interactive terminals; scripts and launchd jobs never
   prompt.
 
