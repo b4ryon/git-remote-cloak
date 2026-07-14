@@ -1,6 +1,6 @@
 # git-remote-cloak
 
-[![CI](https://github.com/b4ryon/git-remote-cloak/actions/workflows/ci.yml/badge.svg)](https://github.com/b4ryon/git-remote-cloak/actions/workflows/ci.yml) &nbsp; [![Go Report Card](https://goreportcard.com/badge/github.com/b4ryon/git-remote-cloak)](https://goreportcard.com/report/github.com/b4ryon/git-remote-cloak)
+[![CI](https://github.com/b4ryon/git-remote-cloak/actions/workflows/ci.yml/badge.svg)](https://github.com/b4ryon/git-remote-cloak/actions/workflows/ci.yml)
 
 A git remote helper that stores an end-to-end encrypted mirror of a git
 repository on any ordinary git host. The host sees only opaque
