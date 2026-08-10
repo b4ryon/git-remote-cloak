@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,9 @@ func TestSavePinsFormatMatchesIndividualWrites(t *testing.T) {
 // the old dir's TOFU pin and downgrade the remote to trust-on-first-use). A
 // read-only cloak/ base makes the adoption rename fail deterministically.
 func TestOpenSurfacesAdoptionRenameFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce Unix directory mode bits")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses directory write permissions, so the rename cannot be made to fail")
 	}

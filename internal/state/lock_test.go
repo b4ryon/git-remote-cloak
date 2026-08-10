@@ -1,8 +1,8 @@
 // Unit test for the per-remote invocation lock: a second acquirer must not
 // proceed while the lock is held, and must proceed once it is released. This
-// exercises the flock mechanism that serializes concurrent cloak invocations
-// (helper and CLI) for a remote; cross-process exclusion relies on the same
-// per-open-file-description lock that two descriptors here contend for.
+// exercises the file-lock mechanism that serializes concurrent cloak
+// invocations (helper and CLI) for a remote; cross-process exclusion relies
+// on the same lock that two descriptors here contend for.
 package state
 
 import (
