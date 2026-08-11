@@ -268,9 +268,8 @@ func loadFile(path string) (Key, error) {
 	if err != nil {
 		return Key{}, cloakerr.New(cloakerr.KeyUnavailable, "load key file", err)
 	}
-	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
-		return Key{}, cloakerr.Newf(cloakerr.KeyUnavailable, "load key file",
-			"%s has mode %04o; refusing group/world-accessible key files (want 0600)", path, perm)
+	if err := checkKeyFilePermissions(path, fi); err != nil {
+		return Key{}, cloakerr.New(cloakerr.KeyUnavailable, "load key file", err)
 	}
 	b, err := os.ReadFile(path) // #nosec G304 -- path is the operator's own configured key file (file:...); reading the configured key is the intended operation
 	if err != nil {
