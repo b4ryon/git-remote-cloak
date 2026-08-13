@@ -132,6 +132,32 @@ git as usual. `git push`, `git pull`, `git fetch`, and `git clone` transparently
 encrypt outbound and decrypt inbound. (Scheduled/background auto-sync is not part
 of the tool.)
 
+### Replicating to a second host (multiple push URLs)
+
+A remote can push to more than one host, so every `git push` also updates an
+independent encrypted mirror (replication, not failover: fetches only ever use
+the remote's fetch URL):
+
+```
+git config --add remote.origin.pushurl cloak::git@github.com:you/notes-private.git
+git config --add remote.origin.pushurl cloak::git@backup-host:you/notes-mirror.git
+```
+
+(The first `--add` repeats the fetch URL: once any pushurl is set, git no
+longer pushes to the fetch URL.) Each push URL is its own cloak backend with
+its own local state (mirror, rollback pin, repo identity) under `.git/cloak/`,
+so integrity alarms and recovery are per URL. `git cloak` commands operate on
+the fetch URL by default; select another backend with `--url`:
+
+```
+git cloak status --remote origin --url cloak::git@backup-host:you/notes-mirror.git
+```
+
+`status`, `repack`, `rekey`, `accept-rollback`, and `accept-repo-change` all
+take `--url`. When rekeying a multi-URL remote, rekey every backend with the
+same `--new-key`; each rekey repoints `cloak.keyRef` at the new key, so reset
+it to the old ref before rekeying the next still-old backend.
+
 ### Obsidian vault sync (example)
 
 A vault is just a folder of files, so there is nothing Obsidian-specific to
@@ -169,6 +195,10 @@ build with a stable self-signed code-signing certificate
   generation regression or repository-identity change (user-presence gated).
 - `key export [--force-insecure]` / `key import` / `key delete`, key transfer,
   backup, and removal (delete requires a typed YES confirmation).
+
+Remote-facing commands take `--remote <name>` (default `origin`) and, on a
+remote with multiple push URLs, `--url <cloak::url>` to pick which backend to
+operate on (default: the fetch URL).
 
 ### Configuration
 
