@@ -97,6 +97,19 @@ a key and a host repo configured.
 Alternative: `go install github.com/b4ryon/git-remote-cloak/cmd/git-remote-cloak@v0.2.9`,
 then `ln -sf git-remote-cloak "$(go env GOPATH)/bin/git-cloak"`.
 
+On Windows, install Go 1.26+ and Git, then run the included script from a
+Command Prompt:
+
+```bat
+build.cmd
+set "PATH=%CD%\bin;%PATH%"
+git cloak version
+```
+
+The script writes both `bin\git-remote-cloak.exe` (the remote helper) and
+`bin\git-cloak.exe` (the `git cloak` command). Add the `bin` directory to your
+user PATH permanently after confirming the build.
+
 ### First repository
 
 ```

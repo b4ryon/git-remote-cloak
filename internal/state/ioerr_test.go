@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -75,6 +76,9 @@ func TestStateIOErrorsCarryContext(t *testing.T) {
 		mustWrap(t, err, `remove state file "`+pinFile+`"`)
 	})
 	t.Run("write dir fsync", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows does not enforce Unix directory mode bits")
+		}
 		// Reaches writeStateFile's post-rename directory-fsync failure branch
 		// (the iter1 write-path durability guard), the write-side twin of the
 		// "remove dir fsync" case below. The temp file is written+fsynced and
@@ -102,6 +106,9 @@ func TestStateIOErrorsCarryContext(t *testing.T) {
 		}
 	})
 	t.Run("remove dir fsync", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows does not enforce Unix directory mode bits")
+		}
 		// Reaches the OTHER removeStateFile failure branch: the post-remove
 		// directory fsync (the iter3 durability guard), distinct from the
 		// os.Remove failure the "remove" subtest above exercises. The pin file

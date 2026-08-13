@@ -11,11 +11,11 @@ package state
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/b4ryon/git-remote-cloak/internal/cloakerr"
 	"github.com/b4ryon/git-remote-cloak/internal/manifest"
@@ -123,7 +123,7 @@ func adoptURLHashDir(base, name, root, url string) error {
 	return nil
 }
 
-// Lock takes an exclusive flock serializing helper and CLI invocations for
+// Lock takes an exclusive file lock serializing helper and CLI invocations for
 // this remote. The returned release function must be called on exit; it
 // reports the first of the unlock/close errors so the caller can log a
 // failed release (an undetected unlock failure or fd leak) instead of
@@ -133,17 +133,22 @@ func (d *Dir) Lock() (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, err
+	if err := lockFile(f); err != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			return nil, fmt.Errorf("lock state file: %w", errors.Join(err, closeErr))
+		}
+		return nil, fmt.Errorf("lock state file: %w", err)
 	}
 	return func() error {
-		unlockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		unlockErr := unlockFile(f)
 		closeErr := f.Close()
 		if unlockErr != nil {
-			return unlockErr
+			return fmt.Errorf("unlock state file: %w", unlockErr)
 		}
-		return closeErr
+		if closeErr != nil {
+			return fmt.Errorf("close state file: %w", closeErr)
+		}
+		return nil
 	}, nil
 }
 
@@ -203,21 +208,6 @@ func writeFileSync(path string, content []byte, perm os.FileMode) error {
 	}
 	if _, err := f.Write(content); err != nil {
 		_ = f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-// syncDir fsyncs a directory so a rename into it is durable across a crash:
-// without it the renamed entry can be lost on power loss even though the
-// file's own data was fsynced.
-func syncDir(path string) error {
-	f, err := os.Open(path) // #nosec G304 -- path is the per-remote state dir Root; never caller- or remote-controlled
-	if err != nil {
 		return err
 	}
 	if err := f.Sync(); err != nil {

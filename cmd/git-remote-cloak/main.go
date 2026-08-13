@@ -8,6 +8,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/b4ryon/git-remote-cloak/internal/cli"
 	"github.com/b4ryon/git-remote-cloak/internal/helper"
@@ -22,8 +23,16 @@ func main() {
 	// scheme before invoking us, so a remote literally named "cloak" arrives as
 	// args[0]=="cloak", and treating that as a CLI request would misroute every
 	// fetch/push through such a remote.
-	if filepath.Base(os.Args[0]) == "git-cloak" {
+	if isCLIInvocation(os.Args[0]) {
 		os.Exit(cli.Main(args, os.Stdin, os.Stdout, os.Stderr))
 	}
 	os.Exit(helper.Main(args, os.Stdin, os.Stdout, os.Stderr))
+}
+
+// isCLIInvocation accepts the Windows executable suffix in addition to the
+// Unix symlink name. Windows has no portable symlink equivalent for installs,
+// so build.cmd copies the helper to git-cloak.exe for `git cloak ...`.
+func isCLIInvocation(argv0 string) bool {
+	name := filepath.Base(argv0)
+	return name == "git-cloak" || strings.EqualFold(name, "git-cloak.exe")
 }
