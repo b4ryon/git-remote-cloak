@@ -352,7 +352,9 @@ func (e *Engine) assembleManifest(curMan *manifest.Manifest, newRefs map[string]
 		base.RepoID = id
 		// cloak hides contents but not the repo's existence, name, owner, or
 		// push metadata; the helper cannot verify host privacy over plain git.
-		e.Log.Warn("creating a new cloak backend on this remote; ensure the host repository is PRIVATE (cloak hides contents, not the repo's existence/name/owner or push timing and sizes)")
+		// The url attribute tells multi-push-URL remotes WHICH backend is new.
+		e.Log.Warn("creating a new cloak backend on this remote; ensure the host repository is PRIVATE (cloak hides contents, not the repo's existence/name/owner or push timing and sizes)",
+			"url", e.Be.URL())
 	}
 	man := nextPushManifest(base, newRefs, e.headForManifest(curMan, newRefs), plan.packs)
 	if err := man.Validate(); err != nil {

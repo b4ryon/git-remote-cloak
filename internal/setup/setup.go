@@ -94,10 +94,12 @@ func OpenLocal(remoteName, url string, stderr io.Writer, role string) (*Session,
 		return nil, cloakerr.New(cloakerr.LocalGit, "read cloak config", err)
 	}
 
+	explicitURL := url != ""
 	url, err = resolveBackendURL(g, localGitDir, remoteName, url)
 	if err != nil {
 		return nil, err
 	}
+	stateName, selector := stateIdentity(g, localGitDir, remoteName, url, explicitURL)
 
 	key, err := keystore.Load(cfg.KeyRef)
 	if err != nil {
@@ -107,7 +109,58 @@ func OpenLocal(remoteName, url string, stderr io.Writer, role string) (*Session,
 			"cloak.keyRef is %q for this repo; verify it points at your key, then run `git cloak keygen` (first machine) or `git cloak key import` (a new machine)", cfg.KeyRef))
 	}
 
-	return wireSession(g, cfg, key, sessionPaths{localGitDir: localGitDir, common: common, url: url, remoteName: remoteName}, stderr, role)
+	return wireSession(g, cfg, key, sessionPaths{
+		localGitDir: localGitDir, common: common, url: url,
+		remoteName: remoteName, stateName: stateName, selector: selector,
+	}, stderr, role)
+}
+
+// stateIdentity decides how this backend's local state directory is keyed and
+// how git-cloak commands address it. The remote name keys the state only when
+// url IS the remote's fetch URL (CLI calls resolve url from it, so they always
+// match); any other URL -- an extra push URL, an anonymous cloak:: URL, a
+// direct helper invocation with an unconfigured name -- keys by the URL itself
+// (state.DirName's url-hash branch), giving every backend an independent
+// mirror, lock, pin set, and applied set. Fixes the shared-state rollback
+// alarm on remotes with multiple push URLs (issue #3). The returned selector
+// is the flag suffix alarm messages append to accept-rollback /
+// accept-repo-change so the printed command targets this exact state dir
+// (empty when a bare `git cloak <cmd>` already does).
+func stateIdentity(g *gitx.G, localGitDir, remoteName, url string, explicitURL bool) (stateName, selector string) {
+	if !explicitURL || matchesFetchURL(g, localGitDir, remoteName, url) {
+		if remoteName != "origin" {
+			return remoteName, "--remote " + remoteName
+		}
+		return remoteName, ""
+	}
+	return "", "--url cloak::" + url
+}
+
+// matchesFetchURL reports whether url (already cloak::-stripped) is
+// remoteName's configured fetch URL. Git applies url.<base>.insteadOf
+// rewrites before invoking a helper, so the raw config value is compared
+// first and `git ls-remote --get-url` (which applies the same rewrites
+// without contacting the remote) second. Only the FIRST configured
+// remote.<name>.url counts: git fetches from it alone, while extra url
+// entries -- like pushurl entries -- are push-only targets that need their
+// own state. An unconfigured remoteName never matches: git only passes
+// configured names, so anything else keys by URL.
+func matchesFetchURL(g *gitx.G, localGitDir, remoteName, url string) bool {
+	if remoteName == "" {
+		return false
+	}
+	raw, err := g.Out(gitx.Opts{GitDir: localGitDir}, "config", "--get-all", "remote."+remoteName+".url")
+	if err != nil || raw == "" {
+		return false
+	}
+	if i := strings.IndexByte(raw, '\n'); i >= 0 {
+		raw = raw[:i]
+	}
+	if strings.TrimPrefix(raw, "cloak::") == url {
+		return true
+	}
+	resolved, err := g.Out(gitx.Opts{GitDir: localGitDir}, "ls-remote", "--get-url", remoteName)
+	return err == nil && strings.TrimPrefix(resolved, "cloak::") == url
 }
 
 // resolveGitDirs resolves the local git directory (honoring GIT_DIR) and the
@@ -170,16 +223,19 @@ type sessionPaths struct {
 	common      string
 	url         string
 	remoteName  string
+	stateName   string // state-dir key; "" keys by url hash (non-fetch URL)
+	selector    string // git-cloak flag suffix addressing this state dir
 }
 
 // wireSession opens the per-remote state dir and lock, sets up per-repo file
 // logging, opens the backend mirror, and assembles the Engine. The returned
 // Session owns the lock and log-file closers.
 func wireSession(g *gitx.G, cfg config.Config, key keystore.Key, p sessionPaths, stderr io.Writer, role string) (*Session, error) {
-	st, err := state.Open(p.common, p.remoteName, p.url)
+	st, err := state.Open(p.common, p.stateName, p.url)
 	if err != nil {
 		return nil, cloakerr.New(cloakerr.LocalGit, "open state dir", err)
 	}
+	st.Selector = p.selector
 	unlock, err := st.Lock()
 	if err != nil {
 		return nil, cloakerr.New(cloakerr.LocalGit, "lock state dir", err)

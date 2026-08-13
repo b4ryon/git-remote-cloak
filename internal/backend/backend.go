@@ -80,6 +80,9 @@ func Open(g *gitx.G, gitDir, url, branch string, log *slog.Logger) (*Backend, er
 	return b, nil
 }
 
+// URL returns the host URL this mirror is bound to.
+func (b *Backend) URL() string { return b.url }
+
 // disablePartial removes the promisor/filter configuration after a host
 // rejected filtering, so subsequent fetches are full.
 func (b *Backend) disablePartial() {

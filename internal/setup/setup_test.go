@@ -12,6 +12,7 @@ import (
 
 	"github.com/b4ryon/git-remote-cloak/internal/gitx"
 	"github.com/b4ryon/git-remote-cloak/internal/keystore"
+	"github.com/b4ryon/git-remote-cloak/internal/state"
 )
 
 // initRepo creates a plain repository with a file-backend master key wired
@@ -47,8 +48,11 @@ func initRepo(t *testing.T) (g *gitx.G, gitDir string) {
 }
 
 func TestOpenLocalWiresSession(t *testing.T) {
-	_, gitDir := initRepo(t)
+	g, gitDir := initRepo(t)
 	host := filepath.Join(t.TempDir(), "host.git")
+	if _, _, err := g.Run(gitx.Opts{GitDir: gitDir}, "remote", "add", "origin", "cloak::"+host); err != nil {
+		t.Fatal(err)
+	}
 
 	s, err := OpenLocal("origin", "cloak::"+host, io.Discard, "cli")
 	if err != nil {
@@ -75,6 +79,79 @@ func TestOpenLocalWiresSession(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(stateRoot, "lock")); err != nil {
 		t.Fatalf("state lock file missing: %v", err)
 	}
+}
+
+// State keying per backend URL (issue #3): the remote name keys the state dir
+// only for the remote's fetch URL; every other URL -- extra push URLs,
+// unconfigured names -- gets its own url-hash dir with an independent pin set,
+// and a Selector so alarm messages print the accept command that reaches it.
+func TestOpenLocalStateKeying(t *testing.T) {
+	mustGit := func(t *testing.T, g *gitx.G, gitDir string, args ...string) {
+		t.Helper()
+		if _, _, err := g.Run(gitx.Opts{GitDir: gitDir}, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open := func(t *testing.T, remote, url string) *Session {
+		t.Helper()
+		s, err := OpenLocal(remote, url, io.Discard, "helper")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	expect := func(t *testing.T, s *Session, root, selector string) {
+		t.Helper()
+		defer s.Close()
+		if s.St.Root != root {
+			t.Fatalf("state root = %q, want %q", s.St.Root, root)
+		}
+		if s.St.Selector != selector {
+			t.Fatalf("selector = %q, want %q", s.St.Selector, selector)
+		}
+	}
+
+	t.Run("pushurl keys by url hash", func(t *testing.T) {
+		g, gitDir := initRepo(t)
+		hostA := filepath.Join(t.TempDir(), "a.git")
+		hostB := filepath.Join(t.TempDir(), "b.git")
+		mustGit(t, g, gitDir, "remote", "add", "origin", "cloak::"+hostA)
+		mustGit(t, g, gitDir, "config", "--add", "remote.origin.pushurl", "cloak::"+hostA)
+		mustGit(t, g, gitDir, "config", "--add", "remote.origin.pushurl", "cloak::"+hostB)
+
+		// The fetch URL (also the first pushurl) keys by remote name, exactly
+		// as a single-URL remote does.
+		expect(t, open(t, "origin", "cloak::"+hostA),
+			filepath.Join(gitDir, "cloak", "origin"), "")
+		// The extra pushurl gets an independent url-hash dir.
+		expect(t, open(t, "origin", "cloak::"+hostB),
+			filepath.Join(gitDir, "cloak", state.DirName("", hostB)), "--url cloak::"+hostB)
+	})
+
+	t.Run("cli empty url keys by remote name", func(t *testing.T) {
+		g, gitDir := initRepo(t)
+		host := filepath.Join(t.TempDir(), "host.git")
+		mustGit(t, g, gitDir, "remote", "add", "mirror", "cloak::"+host)
+		expect(t, open(t, "mirror", ""),
+			filepath.Join(gitDir, "cloak", "mirror"), "--remote mirror")
+	})
+
+	t.Run("insteadOf-rewritten fetch url still keys by remote name", func(t *testing.T) {
+		g, gitDir := initRepo(t)
+		host := filepath.Join(t.TempDir(), "real.git")
+		mustGit(t, g, gitDir, "config", "url.cloak::"+host+".insteadOf", "cloak::SHORT")
+		mustGit(t, g, gitDir, "remote", "add", "origin", "cloak::SHORT")
+		// git hands the helper the rewritten address, not the raw config value.
+		expect(t, open(t, "origin", "cloak::"+host),
+			filepath.Join(gitDir, "cloak", "origin"), "")
+	})
+
+	t.Run("unconfigured remote name keys by url hash", func(t *testing.T) {
+		_, gitDir := initRepo(t)
+		host := filepath.Join(t.TempDir(), "host.git")
+		expect(t, open(t, "nosuchremote", "cloak::"+host),
+			filepath.Join(gitDir, "cloak", state.DirName("", host)), "--url cloak::"+host)
+	})
 }
 
 func TestOpenLocalRejectsNonCloakRemote(t *testing.T) {
