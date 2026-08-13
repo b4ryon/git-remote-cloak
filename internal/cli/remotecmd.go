@@ -57,13 +57,31 @@ func keyFlag(fs *flag.FlagSet) *string {
 	return fs.String("key", keystore.DefaultRef(), "key reference (file:<path>)")
 }
 
+// urlFlag registers the standard --url backend selector on fs. A remote with
+// extra push URLs has one independent cloak backend (and local state dir) per
+// URL; this flag picks which one the command operates on. Empty (the default)
+// selects the remote's fetch URL.
+func urlFlag(fs *flag.FlagSet) *string {
+	return fs.String("url", "", "backend URL to operate on, for remotes with multiple push URLs (e.g. cloak::https://host/repo); default: the remote's fetch URL")
+}
+
+// describeTarget names the backend a command operates on for display: the
+// remote name alone for its fetch URL, name plus URL for a --url selection.
+func describeTarget(remote, url string) string {
+	if url == "" {
+		return remote
+	}
+	return remote + " " + url
+}
+
 func cmdRepack(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("repack", stderr)
 	remote := fs.String("remote", "origin", "cloak remote to repack")
+	url := urlFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	sess, err := setup.Open(*remote, "", stderr, "cli")
+	sess, err := setup.Open(*remote, *url, stderr, "cli")
 	if err != nil {
 		return cliFail(stderr, err)
 	}
@@ -76,13 +94,14 @@ func cmdRepack(args []string, stdout, stderr io.Writer) int {
 		return cliFailLogged(stderr, sess, fmt.Errorf("repack produced a manifest with no packs (internal error)"))
 	}
 	fmt.Fprintf(stdout, "Repacked remote %q: generation %d, single pack of %d bytes (%d refs)\n",
-		*remote, rs.Manifest.Generation, rs.Manifest.Packs[0].Size, len(rs.Manifest.Refs))
+		describeTarget(*remote, *url), rs.Manifest.Generation, rs.Manifest.Packs[0].Size, len(rs.Manifest.Refs))
 	return 0
 }
 
 func cmdRekey(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("rekey", stderr)
 	remote := fs.String("remote", "origin", "cloak remote to rekey")
+	url := urlFlag(fs)
 	newRef := fs.String("new-key", "", "key reference holding the NEW master key (required; create with keygen)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -99,12 +118,12 @@ func cmdRekey(args []string, stdout, stderr io.Writer) int {
 		return cliFail(stderr, err)
 	}
 	defer newKey.Wipe()
-	sess, err := setup.Open(*remote, "", stderr, "cli")
+	sess, err := setup.Open(*remote, *url, stderr, "cli")
 	if err != nil {
 		return cliFail(stderr, err)
 	}
 	defer sess.Close()
-	return runRekey(*remote, *newRef, &newKey, sess, stdout, stderr)
+	return runRekey(describeTarget(*remote, *url), *newRef, &newKey, sess, stdout, stderr)
 }
 
 // runRekey performs the post-setup rekey phase once the new key is loaded and

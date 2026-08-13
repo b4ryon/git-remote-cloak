@@ -117,6 +117,47 @@ func TestCheckPinDecisions(t *testing.T) {
 	}
 }
 
+// Alarm messages must print the accept command that reaches THIS state dir:
+// bare `git cloak accept-*` for the default dir, with the Selector flags
+// appended for a url-keyed dir (a pushurl backend), and the inconsistent-state
+// message must name the actual directory rather than a placeholder.
+func TestAlarmMessagesEmbedSelector(t *testing.T) {
+	d := openDir(t)
+	hash := strings.Repeat("aa", 32)
+	if err := d.SavePin(Pin{Generation: 2, ManifestHash: hash}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default dir: the command stays bare, as before per-URL state existed.
+	if err := d.CheckPin(nil, ""); err == nil || !strings.Contains(err.Error(), "`git cloak accept-rollback`") {
+		t.Fatalf("default-dir rollback alarm lost the bare accept command: %v", err)
+	}
+
+	d.Selector = "--url cloak::https://host/repo"
+	if err := d.CheckPin(nil, ""); err == nil ||
+		!strings.Contains(err.Error(), "`git cloak accept-rollback --url cloak::https://host/repo`") {
+		t.Fatalf("rollback alarm missing the selector: %v", err)
+	}
+
+	if err := d.SaveRepoID("pinned-id"); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest.New()
+	m.RepoID = "other-id"
+	if err := d.CheckRepoID(m); err == nil ||
+		!strings.Contains(err.Error(), "`git cloak accept-repo-change --url cloak::https://host/repo`") {
+		t.Fatalf("repo-id alarm missing the selector: %v", err)
+	}
+
+	// Inconsistent local state (pin without repo-id pin) names the real dir.
+	if err := d.ClearRepoID(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CheckRepoID(m); err == nil || !strings.Contains(err.Error(), d.Root) {
+		t.Fatalf("inconsistent-state alarm does not name the state dir: %v", err)
+	}
+}
+
 // TestCheckRepoIDConsistencyCrossCheck is the CR-005 regression: a missing
 // repo-id pin is trust-on-first-use ONLY at genuine first contact (no pins at
 // all). If a rollback (generation) pin exists but the repo-id pin is gone -- the

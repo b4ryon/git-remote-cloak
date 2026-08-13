@@ -16,16 +16,20 @@ import (
 func cmdStatus(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("status", stderr)
 	remote := fs.String("remote", "origin", "cloak remote to inspect")
+	url := urlFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	sess, err := setup.Open(*remote, "", stderr, "cli")
+	sess, err := setup.Open(*remote, *url, stderr, "cli")
 	if err != nil {
 		return cliFail(stderr, err)
 	}
 	defer sess.Close()
 
 	fmt.Fprintf(stdout, "Remote:     %s\n", *remote)
+	if *url != "" {
+		fmt.Fprintf(stdout, "URL:        %s\n", *url)
+	}
 	fmt.Fprintf(stdout, "Key:        %s (%s)\n", sess.Eng.Key.ID(), sess.Cfg.KeyRef)
 	if sess.RS.Manifest == nil {
 		fmt.Fprintln(stdout, "State:      empty (no backend branch yet; first push creates it)")
@@ -153,13 +157,14 @@ type acceptSpec struct {
 func runAccept(spec acceptSpec, args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet(spec.name, stderr)
 	remote := fs.String("remote", "origin", spec.remoteUsage)
+	url := urlFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if err := userpresence.Require(spec.presence+" on remote "+*remote, stderr); err != nil {
+	if err := userpresence.Require(spec.presence+" on remote "+describeTarget(*remote, *url), stderr); err != nil {
 		return cliFail(stderr, err)
 	}
-	sess, err := setup.OpenLocal(*remote, "", stderr, "cli")
+	sess, err := setup.OpenLocal(*remote, *url, stderr, "cli")
 	if err != nil {
 		return cliFail(stderr, err)
 	}

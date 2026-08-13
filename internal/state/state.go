@@ -1,9 +1,11 @@
-// Package state manages cloak's per-remote local state under
-// .git/cloak/<remote>/: the invocation file lock, the rollback pin
-// (highest accepted generation + manifest ciphertext hash), the applied-pack
-// set, the backend mirror location, temp space, and the debug log path. All
-// state is reconstructible from the remote plus the key; deleting the
-// directory degrades rollback protection to trust-on-first-use.
+// Package state manages cloak's per-backend local state under
+// .git/cloak/<remote>/ (a named remote's fetch URL) or .git/cloak/url-<hash>/
+// (any other backend URL: extra push URLs, anonymous cloak:: URLs): the
+// invocation lock (flock), the rollback pin (highest accepted generation +
+// manifest ciphertext hash), the applied-pack set, the backend mirror
+// location, temp space, and the debug log path. All state is reconstructible
+// from the remote plus the key; deleting the directory degrades rollback
+// protection to trust-on-first-use.
 package state
 
 import (
@@ -56,6 +58,22 @@ func DirName(remoteName, url string) string {
 // Dir is an opened per-remote state directory.
 type Dir struct {
 	Root string
+	// Selector is the git-cloak flag suffix that addresses this state dir
+	// ("--remote mirror", "--url cloak::https://..."); alarm messages embed
+	// it so the printed accept-rollback/accept-repo-change command targets
+	// the right per-URL state. Empty when the default `git cloak <cmd>`
+	// already resolves here.
+	Selector string
+}
+
+// acceptCmd renders the git-cloak command that operates on THIS state dir,
+// appending the selector flags when a bare invocation would resolve to a
+// different (or no) directory.
+func (d *Dir) acceptCmd(sub string) string {
+	if d.Selector == "" {
+		return "git cloak " + sub
+	}
+	return "git cloak " + sub + " " + d.Selector
 }
 
 // Open resolves (and creates) the state directory for the remote under the
@@ -304,7 +322,7 @@ func (d *Dir) CheckPin(m *manifest.Manifest, manifestHash string) error {
 	}
 	if m == nil {
 		return cloakerr.Newf(cloakerr.Rollback, "remote state",
-			"remote is empty but generation %d was previously seen (host rolled back or wiped the repo); run `git cloak accept-rollback` if this is expected", pin.Generation)
+			"remote is empty but generation %d was previously seen (host rolled back or wiped the repo); run `%s` if this is expected", pin.Generation, d.acceptCmd("accept-rollback"))
 	}
 	switch {
 	case m.Generation > pin.Generation:
@@ -318,8 +336,8 @@ func (d *Dir) CheckPin(m *manifest.Manifest, manifestHash string) error {
 		return nil
 	default:
 		return cloakerr.Newf(cloakerr.Rollback, "remote state",
-			"remote generation %d is older than last seen %d (host served stale or replayed state); run `git cloak accept-rollback` if this is expected",
-			m.Generation, pin.Generation)
+			"remote generation %d is older than last seen %d (host served stale or replayed state); run `%s` if this is expected",
+			m.Generation, pin.Generation, d.acceptCmd("accept-rollback"))
 	}
 }
 
@@ -377,14 +395,15 @@ func (d *Dir) CheckRepoID(m *manifest.Manifest) error {
 			return perr
 		} else if hasPin {
 			return cloakerr.Newf(cloakerr.Tamper, "remote state",
-				"inconsistent local state: a rollback pin is set but the repo-identity pin is missing (an interrupted state save or a manual deletion); refusing to trust-on-first-use an identity that could differ. Run `git cloak accept-repo-change` to re-pin the current remote, or delete .git/cloak/<remote> to reset")
+				"inconsistent local state: a rollback pin is set but the repo-identity pin is missing (an interrupted state save or a manual deletion); refusing to trust-on-first-use an identity that could differ. Run `%s` to re-pin the current remote, or delete %s to reset",
+				d.acceptCmd("accept-repo-change"), d.Root)
 		}
 		return nil // trust-on-first-use
 	}
 	if m.RepoID != pinned {
 		return cloakerr.Newf(cloakerr.Tamper, "remote state",
-			"REPO IDENTITY MISMATCH: remote repo id %s does not match pinned %s (the host served a different repository, or this remote points at the wrong URL); run `git cloak accept-repo-change` if this is expected",
-			m.RepoID, pinned)
+			"REPO IDENTITY MISMATCH: remote repo id %s does not match pinned %s (the host served a different repository, or this remote points at the wrong URL); run `%s` if this is expected",
+			m.RepoID, pinned, d.acceptCmd("accept-repo-change"))
 	}
 	return nil
 }
